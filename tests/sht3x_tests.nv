@@ -1,0 +1,130 @@
+// sht3x_tests.nv — the checksum, the two conversions, and the status
+// bit that says the part restarted.
+//
+// RED ON PURPOSE: the first `todo()` each test reaches ends it.
+//
+// THE DATASHEET PUBLISHES A CHECK VALUE, and it is the only number in
+// this module that cannot be derived by reading the source: SHT3x-DIS
+// § 4.4 gives 0xbeef a checksum of 0x92.  A CRC-8 that disagrees with
+// another implementation is almost always a different variant rather
+// than a wrong one, and that number is what says which.
+
+use std.test
+use i2cbus
+use i2csample
+use i2cstatus
+use i2ctiming
+use sht3x
+
+@test
+fn test_the_checksum_is_the_one_the_datasheet_publishes() [io]
+    test.case("0xbeef checksums to 0x92")
+    test.assert_eq(sht3x.crc8(0xbe, 0xef), 0x92)
+
+    test.case("and the polynomial and initial value are named")
+    test.assert_eq(sht3x.SHT3X_CRC_POLYNOMIAL, 0x31)
+    test.assert_eq(sht3x.SHT3X_CRC_INIT, 0xff)
+
+    test.case("a word and its checksum agree or they do not")
+    test.assert(sht3x.crc_ok(0xbe, 0xef, 0x92))
+    test.assert(not sht3x.crc_ok(0xbe, 0xef, 0x00))
+
+@test
+fn test_both_checksums_are_checked_and_not_just_the_first() [io]
+    // The checksum is per word, not per reply.  A driver that checks
+    // only the first has an unchecked humidity.
+    test.case("a reply with a bad second checksum is not usable")
+    let r = sht3x.reply_from(i2cbus.word(0x6666926666ff, 6))
+    test.assert(not sht3x.reply_ok(r))
+    test.assert(not r.hum_crc_ok)
+
+    test.case("and it names why, as a code a device can carry")
+    test.assert_eq(sht3x.reply_status(r), i2cstatus.I2C_STATUS_CRC)
+
+    test.case("a short transfer is refused before either checksum")
+    let short = sht3x.reply_from(i2cbus.word_failed())
+    test.assert(not sht3x.reply_ok(short))
+    test.assert_eq(sht3x.reply_status(short), i2cstatus.I2C_STATUS_DATA_NAK)
+
+@test
+fn test_the_three_repeatabilities_are_three_commands_and_three_waits() [io]
+    // The non-stretching commands, because fifteen milliseconds of a
+    // held clock line is fifteen milliseconds no other part on the bus
+    // can be reached.
+    test.case("high repeatability is 0x2400")
+    test.assert_eq(sht3x.measure_command(sht3x.SHT3X_REPEATABILITY_HIGH), 0x2400)
+    test.assert_eq(sht3x.measure_command(sht3x.SHT3X_REPEATABILITY_MEDIUM), 0x240b)
+    test.assert_eq(sht3x.measure_command(sht3x.SHT3X_REPEATABILITY_LOW), 0x2416)
+
+    test.case("and the waits are the datasheet's maxima, not its typicals")
+    test.assert_eq(i2ctiming.conversion_micros(
+        sht3x.conversion_time(sht3x.SHT3X_REPEATABILITY_HIGH)),
+        15500)
+    test.assert_eq(i2ctiming.conversion_micros(
+        sht3x.conversion_time(sht3x.SHT3X_REPEATABILITY_LOW)),
+        4500)
+
+@test
+fn test_the_scale_is_two_to_the_sixteen_minus_one() [io]
+    // A raw word of 0xffff is exactly 100 %RH with the right
+    // denominator and 99.998 % with the wrong one, which is a humidity
+    // that never quite reaches saturation.
+    test.case("the denominator is 65535")
+    test.assert_eq(sht3x.SHT3X_SCALE, 65535)
+
+    test.case("full scale humidity is exactly a hundred percent")
+    test.assert_eq(sht3x.humidity_of(0xffff), 100000)
+
+    test.case("and the temperature range is fixed by the formula")
+    test.assert_eq(sht3x.temperature_of(0), -45000)
+    test.assert_eq(sht3x.temperature_of(0xffff), 130000)
+
+@test
+fn test_a_reply_that_did_not_check_out_produces_no_reading() [io]
+    let bad = sht3x.reading_of(sht3x.reply_from(i2cbus.word_failed()))
+
+    test.case("not valid, and both numbers zero")
+    test.assert(not bad.valid)
+    test.assert_eq(bad.milli_c, 0)
+    test.assert_eq(bad.milli_rh, 0)
+
+    test.case("and the samples say so too")
+    test.assert(not sht3x.temperature(bad).valid)
+    test.assert(not sht3x.humidity(bad).valid)
+    test.assert_eq(sht3x.humidity(bad).quantity, i2csample.I2C_Q_HUMIDITY)
+
+@test
+fn test_the_dew_point_is_what_a_condensation_alarm_wants() [io]
+    // 80 %RH at 5 °C and 80 %RH at 25 °C are two very different risks,
+    // and relative humidity alone does not distinguish them.
+    test.case("a saturated reading has its dew point at its temperature")
+    let r = sht3x.reading_of(sht3x.reply_from(i2cbus.word(0x6666926666ff, 6)))
+    test.assert(sht3x.dew_point(r) <= r.milli_c)
+
+@test
+fn test_the_status_bit_that_says_the_part_restarted() [io]
+    // A part that browned out has lost its periodic mode, its heater
+    // setting and its alert limits, and answers reads perfectly well.
+    test.case("bit 4 is the one to read every cycle")
+    test.assert(sht3x.status_was_reset(sht3x.SHT3X_STATUS_RESET_DETECTED))
+    test.assert(not sht3x.status_was_reset(0x0000))
+
+    test.case("and the heater bit, because the heater is not a thermostat")
+    test.assert(sht3x.status_heater_on(sht3x.SHT3X_STATUS_HEATER))
+    test.assert(str.len(sht3x.status_name(0x8010)) > 0)
+
+@test
+fn test_the_commands_a_driver_needs_are_named() [io]
+    test.case("break comes before every single-shot command")
+    test.assert_eq(sht3x.SHT3X_CMD_BREAK, 0x3093)
+    test.assert_eq(sht3x.SHT3X_CMD_SOFT_RESET, 0x30a2)
+
+    test.case("the heater and the status register")
+    test.assert_eq(sht3x.SHT3X_CMD_HEATER_ON, 0x306d)
+    test.assert_eq(sht3x.SHT3X_CMD_HEATER_OFF, 0x3066)
+    test.assert_eq(sht3x.SHT3X_CMD_READ_STATUS, 0xf32d)
+    test.assert_eq(sht3x.SHT3X_CMD_CLEAR_STATUS, 0x3041)
+
+    test.case("and the two addresses the ADDR pin selects")
+    test.assert_eq(sht3x.SHT3X_ADDR_LOW, 0x44)
+    test.assert_eq(sht3x.SHT3X_ADDR_HIGH, 0x45)

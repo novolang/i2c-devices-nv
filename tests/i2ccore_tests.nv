@@ -1,0 +1,243 @@
+// i2ccore_tests.nv — the four modules that are not a part: addresses,
+// the word a transfer answers, the faults, the units and the timing.
+//
+// RED ON PURPOSE.  Every body in this package is a `todo()`, so the
+// first call each test makes ends it with `not implemented`.  What the
+// suite checks today is that every signature can be SPELLED by a
+// consumer, with the types a consumer holds — which is the half of a
+// design that a reader cannot check by reading.
+//
+// The assertions are the ones the implementation will have to satisfy,
+// written now so that the first body is written against a test rather
+// than against a memory of the datasheet.
+
+use std.test
+use i2cbus
+use i2cfault
+use i2csample
+use i2cstatus
+use i2ctiming
+
+@test
+fn test_an_address_is_seven_bits_and_a_datasheet_prints_eight() [io]
+    // A program that uses the printed number addresses nothing, and the
+    // symptom is an address NAK on a part that is soldered correctly.
+    test.case("the BME280's printed write address is 0x76 shifted up")
+    test.assert_eq(i2cbus.addr_from_write_byte(0xec), 0x76)
+    test.assert_eq(i2cbus.write_byte_of_addr(0x76), 0xec)
+
+    test.case("the specification's reserved ranges are not addresses")
+    test.assert(not i2cbus.addr_is_valid(0x00))
+    test.assert(not i2cbus.addr_is_valid(0x78))
+    test.assert(i2cbus.addr_is_valid(i2cbus.I2C_ADDR_MIN))
+    test.assert(i2cbus.addr_is_valid(i2cbus.I2C_ADDR_MAX))
+
+@test
+fn test_a_word_carries_its_own_refusal_rather_than_a_sentinel() [io]
+    // An eight-byte read fills all sixty-four bits, so every integer is
+    // a legal answer and -1 is exactly what a bus with no pull-ups
+    // reads back.
+    test.case("a failed transfer is not ok and has no bytes")
+    let bad = i2cbus.word_failed()
+    test.assert(not i2cbus.word_ok(bad))
+    test.assert_eq(bad.count, 0)
+
+    test.case("and a word of all ones is a perfectly good eight bytes")
+    let ones = i2cbus.word(-1, 8)
+    test.assert(i2cbus.word_ok(ones))
+    test.assert_eq(i2cbus.byte_at(ones, 0), 0xff)
+
+@test
+fn test_the_two_byte_orders_are_two_functions() [io]
+    // The BME280 stores its coefficients least significant byte first
+    // and its measurements most significant byte first.  One driver
+    // reading both the same way compensates real measurements with
+    // byte-swapped coefficients.
+    let w = i2cbus.word(0x1234, 2)
+
+    test.case("most significant byte first")
+    test.assert_eq(i2cbus.be_u16_at(w, 0), 0x1234)
+
+    test.case("least significant byte first")
+    test.assert_eq(i2cbus.le_u16_at(w, 0), 0x3412)
+
+    test.case("and the signed forms sign-extend")
+    let neg = i2cbus.word(0xffff, 2)
+    test.assert_eq(i2cbus.be_i16_at(neg, 0), -1)
+    test.assert_eq(i2cbus.le_i16_at(neg, 0), -1)
+
+@test
+fn test_three_bytes_are_twenty_bits_and_not_twenty_four() [io]
+    // The BME280 spreads twenty bits over three registers with the
+    // bottom four bits of the third unused.  Reading them as
+    // twenty-four gives a number sixteen times too large.
+    test.case("the low nibble of the third byte is discarded")
+    let w = i2cbus.word(0x7f8500, 3)
+    test.assert_eq(i2cbus.be_u20_at(w, 0), 0x7f850)
+
+@test
+fn test_a_retry_fixes_three_codes_and_not_the_other_five() [io]
+    // A driver that retries a disconnected sensor forever and one that
+    // gives up on a busy one are the same bug with the sign flipped.
+    test.case("nothing is wrong")
+    test.assert(i2cstatus.is_ok(i2cstatus.I2C_STATUS_OK))
+    test.assert(not i2cstatus.is_ok(i2cstatus.I2C_STATUS_CRC))
+
+    test.case("nobody answered: no retry will help")
+    test.assert(not i2cstatus.is_transient(i2cstatus.I2C_STATUS_ADDRESS_NAK))
+    test.assert(i2cstatus.is_wiring(i2cstatus.I2C_STATUS_ADDRESS_NAK))
+
+    test.case("a corrupted transfer: the next one may be clean")
+    test.assert(i2cstatus.is_transient(i2cstatus.I2C_STATUS_CRC))
+    test.assert(not i2cstatus.is_wiring(i2cstatus.I2C_STATUS_CRC))
+
+    test.case("the wrong part answered: that is a board, not a bus")
+    test.assert(i2cstatus.is_wiring(i2cstatus.I2C_STATUS_WRONG_CHIP))
+
+    test.case("and a saturated part is not retried either")
+    test.assert(not i2cstatus.is_transient(i2cstatus.I2C_STATUS_SATURATED))
+    test.assert(not i2cstatus.is_transient(i2cstatus.I2C_STATUS_UNCALIBRATED))
+    test.assert(not i2cstatus.is_transient(i2cstatus.I2C_STATUS_RESET_VALUE))
+    test.assert(i2cstatus.is_transient(i2cstatus.I2C_STATUS_DATA_NAK))
+    test.assert_eq(i2cstatus.I2C_STATUSES, 9)
+
+@test
+fn test_only_a_read_that_was_too_early_asks_the_caller_to_wait() [io]
+    test.case("every other code is retryable immediately or not at all")
+    test.assert_eq(i2cstatus.retry_after_micros(i2cstatus.I2C_STATUS_CRC,
+                                                15000, 0),
+                                                0)
+
+    test.case("and a read that was too early names the rest of the wait")
+    test.assert_eq(i2cstatus.retry_after_micros(i2cstatus.I2C_STATUS_NOT_READY,
+                                                15000, 9000),
+                                                6000)
+
+    test.case("a code has a name a device can write")
+    test.assert(str.len(i2cstatus.status_name(i2cstatus.I2C_STATUS_UNCALIBRATED)) > 0)
+
+@test
+fn test_a_code_becomes_a_fault_on_the_host_and_nowhere_else() [io]
+    // A fault's variants carry the address, the two checksums or the
+    // raw word, and a payload-carrying variant is a heap value that
+    // `@tier(embedded)` refuses.  So the conversion is one function and
+    // no part module calls it.
+    test.case("nothing is wrong, so there is no fault")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_OK, 0x76, 0)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("an address that did not answer names the address")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_ADDRESS_NAK, 0x76, 0)
+        Some(f) =>
+            test.assert_eq(i2cfault.fault_addr(f), 0x76)
+            test.assert(i2cfault.is_wiring(f))
+            test.assert(not i2cfault.is_transient(f))
+            test.assert(str.len(i2cfault.fault_name(f)) > 0)
+        None    => test.assert(false)
+
+    test.case("and the two answers cannot disagree with the code's")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_CRC, 0x92, 0x00)
+        Some(f) => test.assert_eq(i2cfault.status_of(f), i2cstatus.I2C_STATUS_CRC)
+        None    => test.assert(false)
+
+    test.case("a fault about bytes names no address")
+    test.assert_eq(i2cfault.fault_addr(I2cFaultResetValue(0x80000)), -1)
+    test.assert_eq(i2cfault.fault_addr(I2cFaultDataNak(0x44)), 0x44)
+    test.assert(str.len(i2cfault.fault_name(I2cFaultSaturated(0x23))) > 0)
+    test.assert(str.len(i2cfault.fault_name(I2cFaultWrongChip(0x76, 0x58))) > 0)
+    test.assert(str.len(i2cfault.fault_name(I2cFaultNotReady(9000))) > 0)
+    test.assert(str.len(i2cfault.fault_name(I2cFaultUncalibrated(0x40))) > 0)
+
+@test
+fn test_a_conversion_time_rounds_up_to_the_millisecond() [io]
+    // Truncating 8.7 down to 8 is a read that is too early on every
+    // single cycle, and the part answers the previous measurement.
+    let c = i2ctiming.conversion(8700)
+
+    test.case("nine milliseconds, not eight")
+    test.assert_eq(i2ctiming.conversion_millis_ceil(c), 9)
+    test.assert_eq(i2ctiming.conversion_micros(c), 8700)
+
+    test.case("and a whole number of milliseconds does not gain one")
+    test.assert_eq(i2ctiming.conversion_millis_ceil(i2ctiming.conversion(9000)), 9)
+
+@test
+fn test_the_read_refuses_until_the_caller_has_waited() [io]
+    let c = i2ctiming.conversion(15000)
+
+    test.case("short")
+    test.assert(not i2ctiming.is_elapsed(c, 9000))
+    test.assert_eq(i2ctiming.remaining_micros(c, 9000), 6000)
+
+    test.case("long enough")
+    test.assert(i2ctiming.is_elapsed(c, 20000))
+    test.assert_eq(i2ctiming.remaining_micros(c, 20000), 0)
+
+    test.case("and the refusal is a code the device can carry")
+    test.assert_eq(i2ctiming.ready_status(c, 9000), i2cstatus.I2C_STATUS_NOT_READY)
+    test.assert_eq(i2ctiming.ready_status(c, 20000), i2cstatus.I2C_STATUS_OK)
+
+@test
+fn test_a_node_with_three_parts_waits_once() [io]
+    // Waiting for each in turn costs the sum rather than the maximum,
+    // which on a battery is the difference between a hundred and forty
+    // milliseconds awake and three hundred.
+    test.case("the longest of the three")
+    let both = i2ctiming.longest(i2ctiming.conversion(9000),
+                                 i2ctiming.conversion(120000))
+    test.assert_eq(both.micros, 120000)
+
+    test.case("a part already measuring needs no wait at all")
+    test.assert_eq(i2ctiming.immediate().micros, 0)
+
+@test
+fn test_a_reading_is_one_quantity_in_one_integer_unit() [io]
+    test.case("thousandths of a degree")
+    let s = i2csample.sample(i2csample.I2C_Q_TEMPERATURE, 24500)
+    test.assert_eq(s.value, 24500)
+    test.assert(s.valid)
+
+    test.case("a quantity the part does not measure is not a zero")
+    test.assert(not i2csample.no_sample(i2csample.I2C_Q_PRESSURE).valid)
+
+    test.case("and each quantity names its unit")
+    test.assert_eq(i2csample.unit_name(i2csample.I2C_Q_PRESSURE), "Pa")
+    test.assert(str.len(i2csample.quantity_name(i2csample.I2C_Q_HUMIDITY)) > 0)
+
+@test
+fn test_a_negative_reading_prints_its_sign_once() [io]
+    // -0.5 has a whole part of 0, so the sign is not recoverable from
+    // the whole part alone — and a temperature printed as "0.500" when
+    // it is half a degree below freezing is wrong for one degree of the
+    // range and right everywhere else.
+    test.case("the whole part truncates toward zero")
+    test.assert_eq(i2csample.whole(-1500), -1)
+    test.assert_eq(i2csample.whole(24500), 24)
+
+    test.case("the fraction is always positive")
+    test.assert_eq(i2csample.milli_fraction(-1500), 500)
+    test.assert_eq(i2csample.milli_fraction(24500), 500)
+
+    test.case("and the sign is its own question")
+    test.assert(i2csample.is_negative(-500))
+    test.assert_eq(i2csample.whole(-500), 0)
+
+@test
+fn test_a_plausible_number_outside_the_range_is_not_a_measurement() [io]
+    // The failure this package is most likely to hand a caller is a
+    // plausible number: a byte-swapped coefficient produces a
+    // temperature of a hundred and eighty degrees in a room.
+    test.case("no part here measures 180 C")
+    let hot = i2csample.sample(i2csample.I2C_Q_TEMPERATURE, 180000)
+    test.assert(not i2csample.in_range(hot))
+    test.assert(not i2csample.range_checked(hot).valid)
+
+    test.case("and 24.5 C is inside every part's range")
+    let ok = i2csample.sample(i2csample.I2C_Q_TEMPERATURE, 24500)
+    test.assert(i2csample.in_range(ok))
+    test.assert(i2csample.range_checked(ok).valid)
+
+    test.case("the bounds are published")
+    test.assert(i2csample.quantity_min(i2csample.I2C_Q_TEMPERATURE) <= -40000)
+    test.assert(i2csample.quantity_max(i2csample.I2C_Q_HUMIDITY) >= 100000)

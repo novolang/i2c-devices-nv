@@ -1,0 +1,132 @@
+// i2ctiming.nv — a conversion time is a number the caller waits, not a
+// sleep the driver hides.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  There is no
+// clock in this package and there is no sleep: both are the caller's.
+//
+// THIS IS THE LOAD-BEARING INTERFACE OF THE WHOLE PACKAGE, and the
+// argument is that every part here measures on request and none of them
+// measures instantly.  A BME280 in forced mode at the oversampling its
+// own datasheet recommends takes about nine milliseconds; an SHT3x at
+// high repeatability takes fifteen; a BH1750 in high-resolution mode
+// takes a hundred and twenty.  Reading before that is finished does NOT
+// fail in the obvious way:
+//
+//   - the BME280 answers the PREVIOUS measurement, which is a real
+//     number from a real sensor and is simply old;
+//   - the SHT3x refuses the read with a NAK, which a driver that
+//     treats every NAK as a bus fault reports as broken wiring;
+//   - the BH1750 answers a partial integration, which is a light level
+//     that is too low in proportion to how early the read was.
+//
+// So a driver whose `read()` both triggers and returns has to sleep
+// inside, which means it needs a clock, which means it needs an effect
+// this package does not want, which means the package cannot go in
+// firmware where a scheduler already owns the waiting.  The alternative
+// taken here: a measurement is TWO calls, the first answers how long to
+// wait, and the second takes how long the caller actually waited and
+// REFUSES when it is not enough.  A caller cannot forget the wait,
+// because the second call will not produce a reading without it.
+
+// How long a part needs before its measurement can be read.
+pub @value
+struct I2cConversion
+    // The wait, in microseconds.
+    micros: Int
+
+// A conversion of `micros` microseconds.
+//
+// ```novo
+// use i2ctiming
+//
+// fn main() [io]
+//     println("${i2ctiming.conversion(15000).micros}")   // 15000
+// ```
+pub @tier(embedded)
+fn conversion(micros: Int) -> I2cConversion []
+    todo("i2c-devices-nv.i2ctiming.conversion")
+
+// The wait in microseconds.
+pub @tier(embedded)
+fn conversion_micros(c: I2cConversion) -> Int []
+    todo("i2c-devices-nv.i2ctiming.conversion_micros")
+
+// The wait in whole milliseconds, ROUNDED UP.
+//
+// Rounded up because the delay a caller has is almost always
+// millisecond-granular — `hal.timer` and every scheduler in this
+// project count milliseconds — and truncating 8.7 down to 8 is a read
+// that is too early on every single cycle.  A driver that got this
+// wrong reads stale data forever and nothing in the system reports an
+// error.
+//
+// ```novo
+// use i2ctiming
+//
+// fn main() [io]
+//     println("${i2ctiming.conversion_millis_ceil(i2ctiming.conversion(8700))}")   // 9
+// ```
+pub @tier(embedded)
+fn conversion_millis_ceil(c: I2cConversion) -> Int []
+    todo("i2c-devices-nv.i2ctiming.conversion_millis_ceil")
+
+// Whether a caller that waited `waited_micros` has waited long enough.
+//
+// ```novo
+// use i2ctiming
+//
+// fn main() [io]
+//     let c = i2ctiming.conversion(15000)
+//     println("${i2ctiming.is_elapsed(c, 20000)}")   // true
+//     println("${i2ctiming.is_elapsed(c, 9000)}")    // false
+// ```
+pub @tier(embedded)
+fn is_elapsed(c: I2cConversion, waited_micros: Int) -> Bool []
+    todo("i2c-devices-nv.i2ctiming.is_elapsed")
+
+// How much of the wait is left, in microseconds, or zero.
+pub @tier(embedded)
+fn remaining_micros(c: I2cConversion, waited_micros: Int) -> Int []
+    todo("i2c-devices-nv.i2ctiming.remaining_micros")
+
+// The `i2cstatus` code a read after this much waiting gets.
+//
+// `I2C_STATUS_OK` once the conversion time has elapsed and
+// `I2C_STATUS_NOT_READY` before it.  The one function every `read_*` in
+// this package calls first.
+pub @tier(embedded)
+fn ready_status(c: I2cConversion, waited_micros: Int) -> Int []
+    todo("i2c-devices-nv.i2ctiming.ready_status")
+
+// The longer of two conversions.
+//
+// A node with three parts on one bus triggers all three and waits once,
+// and this is the number it waits.  Written here rather than left to
+// the caller because the obvious alternative — waiting for each in turn
+// — costs the sum rather than the maximum, and on a battery that is the
+// difference between a hundred and forty milliseconds awake and three
+// hundred.
+//
+// ```novo
+// use i2ctiming
+//
+// fn main() [io]
+//     let both = i2ctiming.longest(i2ctiming.conversion(9000),
+//                                  i2ctiming.conversion(120000))
+//     println("${both.micros}")   // 120000
+// ```
+pub @tier(embedded)
+fn longest(a: I2cConversion, b: I2cConversion) -> I2cConversion []
+    todo("i2c-devices-nv.i2ctiming.longest")
+
+// A conversion that is already finished: zero microseconds.
+//
+// What a part in continuous-measurement mode answers, where the
+// measurement being read was triggered by the part itself and the
+// caller's only obligation is not to read faster than the part
+// produces.
+pub @tier(embedded)
+fn immediate() -> I2cConversion []
+    todo("i2c-devices-nv.i2ctiming.immediate")

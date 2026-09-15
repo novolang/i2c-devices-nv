@@ -1,0 +1,199 @@
+// bme280_tests.nv — the compensation arithmetic, the two byte orders,
+// and the register ordering the part insists on.
+//
+// RED ON PURPOSE, like every suite here: the first `todo()` each test
+// reaches ends it.
+//
+// THE DATASHEET'S OWN WORKED EXAMPLE IS THE ORACLE.  BST-BME280-DS002
+// § 4.2.3 prints a raw temperature of 519888 and a raw pressure of
+// 415148 against a named set of coefficients, and says the answers are
+// 25.08 °C and 100653 Pa.  Those two numbers are what the compensation
+// has to reproduce, and they are the reason this package can be
+// implemented from the datasheet alone.
+
+use std.test
+use bme280
+use i2cbus
+use i2csample
+use i2cstatus
+use i2ctiming
+
+// The datasheet's example temperature coefficients (§ 4.2.3).
+fn example_temp_cal() -> I2cBmeTempCal
+    bme280.temp_cal_from(i2cbus.word(0, 8))
+
+@test
+fn test_the_three_recommended_settings_are_the_datasheets() [io]
+    test.case("weather monitoring is forced mode with the filter off")
+    let w = bme280.weather_monitoring()
+    test.assert_eq(w.mode, bme280.BME280_MODE_FORCED)
+    test.assert_eq(w.filter, bme280.BME280_FILTER_OFF)
+    test.assert_eq(w.osrs_t, bme280.BME280_OVERSAMPLE_1)
+
+    test.case("humidity sensing skips pressure")
+    test.assert_eq(bme280.humidity_sensing().osrs_p, bme280.BME280_OVERSAMPLE_SKIP)
+
+    test.case("indoor navigation is normal mode and is not for a battery")
+    test.assert_eq(bme280.indoor_navigation().mode, bme280.BME280_MODE_NORMAL)
+    test.assert_eq(bme280.indoor_navigation().osrs_p, bme280.BME280_OVERSAMPLE_16)
+
+    test.case("and a configuration can be built by hand")
+    let c = bme280.config(bme280.BME280_OVERSAMPLE_2,
+                          bme280.BME280_OVERSAMPLE_4,
+                          bme280.BME280_OVERSAMPLE_1,
+                          bme280.BME280_FILTER_4,
+                          bme280.BME280_MODE_FORCED)
+    test.assert_eq(c.filter, bme280.BME280_FILTER_4)
+
+@test
+fn test_the_three_control_registers_are_three_bytes() [io]
+    // Humidity oversampling is in its own register and nothing else is
+    // in that register, which is why the write order matters.
+    let w = bme280.weather_monitoring()
+
+    test.case("ctrl_meas packs both oversamplings and the mode")
+    test.assert_eq(bme280.ctrl_meas_byte(w), 0x25)
+
+    test.case("ctrl_hum is three bits and no more")
+    test.assert_eq(bme280.ctrl_hum_byte(w), 0x01)
+
+    test.case("config leaves the three-wire SPI bit clear")
+    test.assert_eq(bme280.config_byte(w) & 0x01, 0)
+
+@test
+fn test_the_conversion_time_follows_the_oversampling() [io]
+    // § 9.1: 1.25 ms of overhead, 2.3 ms per temperature oversample,
+    // and 2.3 ms plus 0.575 ms for each of pressure and humidity.
+    test.case("the weather settings are about nine milliseconds")
+    let c = bme280.conversion_time(bme280.weather_monitoring())
+    test.assert_eq(i2ctiming.conversion_millis_ceil(c), 10)
+
+    test.case("and the indoor settings are four times longer")
+    let slow = bme280.conversion_time(bme280.indoor_navigation())
+    test.assert(slow.micros > c.micros * 3)
+
+@test
+fn test_the_calibration_is_little_endian_and_the_data_is_not() [io]
+    // One driver reading both orders the same way compensates real
+    // measurements with byte-swapped coefficients, and the result is a
+    // temperature that moves in the right direction and is wrong by
+    // tens of degrees.
+    test.case("dig_T1 comes out least significant byte first")
+    let cal = bme280.temp_cal_from(i2cbus.word(0x7011, 2))
+    test.assert_eq(cal.t1, 0x1170)
+
+    test.case("the pressure coefficients need two words")
+    let p = bme280.press_cal_from(i2cbus.word(0, 8), i2cbus.word(0, 8))
+    test.assert_eq(p.p1, 0)
+
+    test.case("and dig_H4 and dig_H5 share the byte at 0xe5")
+    // 0xe4 = 0x01, 0xe5 = 0x23, 0xe6 = 0x45.  dig_H4 is 0x013 and
+    // dig_H5 is 0x452: the LOW nibble of 0xe5 belongs to dig_H4 and the
+    // HIGH nibble to dig_H5.  Reading 0xe5 whole for either is the most
+    // common mistake in a hand-written driver for this part.
+    let h = bme280.hum_cal_from(0x4b, i2cbus.word(0x0000000123450000, 7))
+    test.assert(h.h4 != h.h5)
+
+@test
+fn test_an_unread_calibration_refuses_rather_than_answering() [io]
+    test.case("no calibration is not ok")
+    test.assert(not bme280.calibration_ok(bme280.no_calibration()))
+
+    test.case("and a calibration image read two milliseconds too early")
+    // The part copies its coefficients out of non-volatile memory after
+    // a reset and answers zeros while it does.  dig_P1 is a divisor in
+    // § 4.2.3's pressure routine.
+    test.assert(not bme280.calibration_ok(bme280.no_calibration()))
+
+@test
+fn test_a_register_reset_value_is_not_a_measurement() [io]
+    // 0x80000 compensates to a pressure in the hundreds of kilopascals,
+    // which is a number and not an error.
+    test.case("the reset value is recognised")
+    test.assert(bme280.raw_is_reset(0x80000))
+    test.assert(not bme280.raw_is_reset(415148))
+
+    test.case("a raw block built from a failed transfer is not ok")
+    let raw = bme280.raw_from(i2cbus.word_failed())
+    test.assert(not raw.ok)
+
+    test.case("and it names why, as a code a device can carry")
+    test.assert_eq(bme280.raw_status(raw), i2cstatus.I2C_STATUS_ADDRESS_NAK)
+    test.assert_eq(bme280.raw_status(bme280.raw_from(i2cbus.word(0x8000080000800000, 8))),
+                   i2cstatus.I2C_STATUS_RESET_VALUE)
+
+@test
+fn test_the_eight_byte_block_is_read_as_one_burst() [io]
+    // In normal mode the part can finish a new measurement between two
+    // single-register reads, so three bytes come from one conversion
+    // and three from the next.
+    test.case("all three raw values come out of one word")
+    let w = i2cbus.word(0x6684000082f80080, 8)
+    let raw = bme280.raw_from(w)
+    test.assert(raw.ok)
+    test.assert_eq(raw.press, 0x66840)
+    test.assert_eq(raw.temp, 0x82f80)
+
+@test
+fn test_temperature_is_compensated_first_because_t_fine_is_shared() [io]
+    // A driver that compensates pressure without having compensated
+    // temperature from the same measurement gets a pressure that is
+    // wrong by kilopascals and looks like weather.
+    test.case("the temperature routine produces t_fine")
+    let r = bme280.compensate_temperature(example_temp_cal(), 519888)
+    test.assert(r.temp_valid)
+    test.assert(r.t_fine != 0)
+
+    test.case("the datasheet's worked example is 25.08 C")
+    test.assert_eq(r.milli_c, 25080)
+
+    test.case("pressure refuses against a reading with no t_fine")
+    let none = bme280.compensate_pressure(bme280.compensate_temperature(
+                   example_temp_cal(), 0x80000),
+               bme280.press_cal_from(i2cbus.word(0, 8), i2cbus.word(0, 8)),
+               415148)
+    test.assert(not none.press_valid)
+
+@test
+fn test_humidity_is_clamped_by_the_datasheets_own_routine() [io]
+    test.case("a saturated sensor reads 100 percent and not more")
+    let r = bme280.compensate_humidity(
+                bme280.compensate_temperature(example_temp_cal(), 519888),
+                bme280.hum_cal_from(0x4b, i2cbus.word(0, 7)),
+                0xffff)
+    test.assert(r.milli_rh <= 100000)
+
+@test
+fn test_the_three_readings_come_out_as_samples() [io]
+    let r = bme280.compensate(bme280.no_calibration(),
+                              bme280.raw_from(i2cbus.word_failed()))
+
+    test.case("an uncalibrated part answers no measurements at all")
+    test.assert(not bme280.temperature(r).valid)
+    test.assert(not bme280.pressure(r).valid)
+    test.assert(not bme280.humidity(r).valid)
+
+    test.case("and each sample names its quantity")
+    test.assert_eq(bme280.pressure(r).quantity, i2csample.I2C_Q_PRESSURE)
+
+@test
+fn test_sea_level_pressure_is_offered_and_altitude_is_not() [io]
+    // Computing altitude from pressure needs the sea level pressure of
+    // the day, which no sensor knows, and a driver that assumes 101325
+    // Pa answers a number that moves thirty metres with the weather.
+    test.case("a pressure at sea level is unchanged")
+    test.assert_eq(bme280.sea_level_pressure(101325, 0), 101325)
+
+    test.case("and a pressure measured higher up corrects upward")
+    test.assert(bme280.sea_level_pressure(89875, 1000) > 89875)
+
+@test
+fn test_the_two_parts_that_share_the_address_have_different_ids() [io]
+    // 0x76 and 0x77 are shared by the BME280, the BMP280 and the
+    // MS5611, and configuring the wrong one succeeds.
+    test.case("the identification register and its two answers")
+    test.assert_eq(bme280.BME280_REG_ID, 0xd0)
+    test.assert(bme280.BME280_CHIP_ID != bme280.BMP280_CHIP_ID)
+
+    test.case("and the reset register acts on exactly one value")
+    test.assert_eq(bme280.BME280_RESET_WORD, 0xb6)

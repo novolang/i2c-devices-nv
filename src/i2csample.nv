@@ -1,0 +1,192 @@
+// i2csample.nv — one measured quantity, in an integer unit, with the
+// range the part is specified over.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+//
+// INTEGERS, NOT FLOATS, AND THAT IS ABOUT THE TARGET.  A Cortex-M0+ has
+// no floating-point unit, so every Float multiply is a call into a
+// software library; a Cortex-M4F has one for single precision and
+// novo-lang's `Float` is double.  A sensor driver that answers `Float`
+// therefore costs the smallest parts a subroutine call per reading and
+// the middle-sized ones a conversion they did not ask for.  Every part
+// in this package produces an integer anyway — the BME280's
+// compensation is defined on integers in the datasheet — so a Float
+// here would be a conversion out of the sensor's own arithmetic and
+// back again.
+//
+// THE UNITS ARE FINER THAN ANY PART'S OWN, for the same reason a
+// protocol picks the widest field: the BME280 reports temperature in
+// hundredths of a degree and the SHT3x in a sixteen-bit ratio over 175
+// degrees, and a unit that fits one truncates the other.  Thousandths
+// hold both with room over.
+//
+// A SAMPLE IS ONE QUANTITY.  A part that measures three things answers
+// its own reading struct with three fields, and the accessors on it
+// produce these.  A shared struct with a field per quantity would be
+// mostly empty on every part in the package.
+
+// ── The quantities ───────────────────────────────────────────────────
+
+// Temperature, in thousandths of a degree Celsius.
+pub const I2C_Q_TEMPERATURE = 0
+// Relative humidity, in thousandths of a percent.
+pub const I2C_Q_HUMIDITY = 1
+// Absolute pressure, in pascals.
+pub const I2C_Q_PRESSURE = 2
+// Illuminance, in thousandths of a lux.
+pub const I2C_Q_ILLUMINANCE = 3
+// Potential difference, in microvolts.
+pub const I2C_Q_VOLTAGE = 4
+// Current, in microamperes.
+pub const I2C_Q_CURRENT = 5
+// Power, in microwatts.
+pub const I2C_Q_POWER = 6
+
+// How many quantities this package measures: 7.
+pub const I2C_QUANTITIES = 7
+
+// ── A sample ─────────────────────────────────────────────────────────
+
+// One measured quantity, and whether it is a measurement at all.
+//
+// THE VALIDITY IS A FIELD BECAUSE A `@value` CANNOT BE AN OPTIONAL
+// (E2015), and because the honest answer from a sensor is often "this
+// part does not measure that": an SHT3x has no pressure, and a BME280
+// wired as a BMP280 has no humidity.  `valid` is false there, and the
+// value is zero rather than a plausible number.
+pub @value
+struct I2cSample
+    // One of the `I2C_Q_*` constants.
+    quantity: Int
+    // The value, in that quantity's unit.
+    value: Int
+    // Whether this is a measurement.
+    valid: Bool
+
+// A measured sample.
+//
+// ```novo
+// use i2csample
+//
+// fn main() [io]
+//     let s = i2csample.sample(i2csample.I2C_Q_TEMPERATURE, 24500)
+//     println("${s.value}")   // 24500, which is 24.5 C
+// ```
+pub @tier(embedded)
+fn sample(quantity: Int, value: Int) -> I2cSample []
+    todo("i2c-devices-nv.i2csample.sample")
+
+// A quantity this part does not measure, or did not measure.
+pub @tier(embedded)
+fn no_sample(quantity: Int) -> I2cSample []
+    todo("i2c-devices-nv.i2csample.no_sample")
+
+// The quantity's unit in words, for a log line or a label.
+//
+// ```novo
+// use i2csample
+//
+// fn main() [io]
+//     println(i2csample.unit_name(i2csample.I2C_Q_PRESSURE))   // Pa
+// ```
+pub @tier(embedded)
+fn unit_name(quantity: Int) -> Str []
+    todo("i2c-devices-nv.i2csample.unit_name")
+
+// The quantity in words.
+pub @tier(embedded)
+fn quantity_name(quantity: Int) -> Str []
+    todo("i2c-devices-nv.i2csample.quantity_name")
+
+// ── Reading one for a person ─────────────────────────────────────────
+//
+// A device prints a reading without a heap: string interpolation and
+// `Str` concatenation both allocate and are refused at
+// `@tier(embedded)`, so a program writes the parts one at a time.
+// These are the parts.
+
+// The whole units of a thousandths-scaled value, with the sign.
+//
+// -1500 answers -1, not -2: the whole part truncates toward zero, so
+// that the whole and the fraction read as one number written out.
+//
+// ```novo
+// use i2csample
+//
+// fn main() [io]
+//     println("${i2csample.whole(24500)}")    // 24
+//     println("${i2csample.whole(-1500)}")    // -1
+// ```
+pub @tier(embedded)
+fn whole(milli: Int) -> Int []
+    todo("i2c-devices-nv.i2csample.whole")
+
+// The fractional thousandths of a thousandths-scaled value, always
+// positive, 0 to 999.
+//
+// POSITIVE EVEN FOR A NEGATIVE VALUE, because the printed form is a
+// sign, a whole part and a fraction, and a fraction carrying its own
+// sign prints "-1.-500".  A caller writes the sign once, from
+// `is_negative`.
+pub @tier(embedded)
+fn milli_fraction(milli: Int) -> Int []
+    todo("i2c-devices-nv.i2csample.milli_fraction")
+
+// Whether the value is below zero.
+//
+// Needed separately because -0.5 has a whole part of 0, so the sign is
+// not recoverable from `whole` alone — and a temperature printed as
+// "0.500" when it is half a degree below freezing is a bug that only
+// appears for one degree of the range.
+pub @tier(embedded)
+fn is_negative(milli: Int) -> Bool []
+    todo("i2c-devices-nv.i2csample.is_negative")
+
+// ── The ranges a part is specified over ──────────────────────────────
+
+// The lowest value of `quantity` any part in this package is specified
+// to measure, in the quantity's unit.
+//
+// Temperature -40000 (-40 °C), humidity 0, pressure 30000 Pa,
+// illuminance 0, and the electrical quantities are signed and have no
+// floor worth asserting, so they answer the smallest value their
+// register can hold.
+pub @tier(embedded)
+fn quantity_min(quantity: Int) -> Int []
+    todo("i2c-devices-nv.i2csample.quantity_min")
+
+// The highest value of `quantity` any part in this package is specified
+// to measure, in the quantity's unit.
+pub @tier(embedded)
+fn quantity_max(quantity: Int) -> Int []
+    todo("i2c-devices-nv.i2csample.quantity_max")
+
+// Whether a sample is inside the range its quantity is specified over.
+//
+// The check worth making on every reading, because the failure this
+// package is most likely to hand a caller is a PLAUSIBLE number: an
+// uncompensated BME280 register reads its reset value and compensates
+// to a pressure in the hundreds of kilopascals, and a byte-swapped
+// coefficient produces a temperature of a hundred and eighty degrees in
+// a room.  Neither is caught by asking whether the transfer succeeded.
+//
+// ```novo
+// use i2csample
+//
+// fn main() [io]
+//     let s = i2csample.sample(i2csample.I2C_Q_TEMPERATURE, 180000)
+//     println("${i2csample.in_range(s)}")   // false, no part measures 180 C
+// ```
+pub @tier(embedded)
+fn in_range(s: I2cSample) -> Bool []
+    todo("i2c-devices-nv.i2csample.in_range")
+
+// The sample, with `valid` cleared when it is outside its range.
+//
+// What a driver's accessor answers, so that an out-of-range number
+// never leaves the package looking like a measurement.
+pub @tier(embedded)
+fn range_checked(s: I2cSample) -> I2cSample []
+    todo("i2c-devices-nv.i2csample.range_checked")

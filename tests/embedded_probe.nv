@@ -1,0 +1,333 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A BATTERY-POWERED NODE WITH THREE PARTS ON ONE BUS.
+// It wakes, triggers three measurements, waits the longest of the three
+// conversion times, reads three bursts of bytes, and turns them into
+// numbers.  Everything after the last byte arrives is integer
+// arithmetic — the BME280's twenty compensation coefficients, the
+// SHT3x's checksum and linear scale, the BH1750's divisor and the
+// INA219's calibrated LSB — and this program is that arithmetic
+// compiled for the hardware rather than a sentence claiming it would
+// compile.
+//
+// WHAT IS NOT HERE, AND WHY.  `i2cfault` is not named anywhere in the
+// use graph below, and that is the design rather than an omission: an
+// `I2cFault` variant carries an address or a pair of checksums, a
+// payload-carrying enum variant is a heap value, and `@tier(embedded)`
+// refuses to construct one.  Every part module answers an `i2cstatus`
+// code instead, `i2cstatus` is what they import, and turning a code
+// into a fault is something the host does after the bytes have arrived.
+//
+// The bus functions are not here either, and for a different reason:
+// they are generic over `I2cDeviceBus[e]` and a firmware supplies the
+// peripheral.  `i2cbus`'s own word accessors ARE here, because they are
+// the shift-and-mask arithmetic that turns eight bytes in one integer
+// into three measurements, and they are the part most likely to be
+// lowered differently on a thirty-two bit core.
+
+use std.str
+use bh1750
+use bme280
+use i2cbus
+use i2csample
+use i2cstatus
+use i2ctiming
+use ina219
+use sht3x
+
+// The eight-byte measurement block of a BME280, built the way firmware
+// builds it: from one integer, with nothing allocated to stage it.
+@tier(embedded)
+fn a_measurement_block() -> I2cWord
+    i2cbus.word(0x6684000082f80080, 8)
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+//
+// A firmware image has one line of output; making it depend on all of
+// them is what stops a passing run from meaning "the first check held".
+@tier(embedded)
+fn score() -> Int
+    var n = 0
+
+    // The word a transfer answers, and the two byte orders the BME280
+    // mixes.  A driver reading both the same way compensates real
+    // measurements with byte-swapped coefficients.
+    let w = a_measurement_block()
+    if i2cbus.word_ok(w)
+        n = n + 1
+    if i2cbus.byte_at(w, 0) == 0x66
+        n = n + 1
+    if i2cbus.be_u20_at(w, 0) == 0x66840
+        n = n + 1
+    if i2cbus.be_u16_at(i2cbus.word(0x1234, 2), 0) == 0x1234
+        n = n + 1
+    if i2cbus.le_u16_at(i2cbus.word(0x1234, 2), 0) == 0x3412
+        n = n + 1
+    if i2cbus.be_i16_at(i2cbus.word(0xffff, 2), 0) == -1
+        n = n + 1
+    if i2cbus.le_i16_at(i2cbus.word(0xffff, 2), 0) == -1
+        n = n + 1
+    if i2cbus.addr_from_write_byte(0xec) == bme280.BME280_ADDR_LOW
+        n = n + 1
+    if i2cbus.write_byte_of_addr(bme280.BME280_ADDR_LOW) == 0xec
+        n = n + 1
+    if i2cbus.addr_is_valid(bme280.BME280_ADDR_LOW)
+        n = n + 1
+    if i2cbus.word_status(i2cbus.word_failed()) == i2cstatus.I2C_STATUS_ADDRESS_NAK
+        n = n + 1
+    if not i2cbus.word_ok(i2cbus.word_failed())
+        n = n + 1
+
+    // The timing discipline, which is why a node can sleep through a
+    // conversion instead of holding the bus.  Rounding the wait DOWN to
+    // the millisecond is a read that is too early on every cycle.
+    let c = i2ctiming.conversion(8700)
+    if i2ctiming.conversion_micros(c) == 8700
+        n = n + 1
+    if i2ctiming.conversion_millis_ceil(c) == 9
+        n = n + 1
+    if i2ctiming.is_elapsed(c, 9000)
+        n = n + 1
+    if i2ctiming.remaining_micros(c, 1000) == 7700
+        n = n + 1
+    if i2ctiming.ready_status(c, 1000) == i2cstatus.I2C_STATUS_NOT_READY
+        n = n + 1
+    if i2ctiming.longest(c, i2ctiming.conversion(120000)).micros == 120000
+        n = n + 1
+    if i2ctiming.immediate().micros == 0
+        n = n + 1
+
+    // The status vocabulary, which is the whole of what a device says
+    // about a failure.  A retry against an address that never answered
+    // is a loop that does not end.
+    if i2cstatus.is_ok(i2cstatus.I2C_STATUS_OK)
+        n = n + 1
+    if not i2cstatus.is_transient(i2cstatus.I2C_STATUS_ADDRESS_NAK)
+        n = n + 1
+    if i2cstatus.is_transient(i2cstatus.I2C_STATUS_CRC)
+        n = n + 1
+    if i2cstatus.is_wiring(i2cstatus.I2C_STATUS_WRONG_CHIP)
+        n = n + 1
+    if i2cstatus.retry_after_micros(i2cstatus.I2C_STATUS_NOT_READY, 15000, 9000) == 6000
+        n = n + 1
+    if str.len(i2cstatus.status_name(i2cstatus.I2C_STATUS_CRC)) > 0
+        n = n + 1
+
+    // The units, and printing one without a heap.  String interpolation
+    // and `Str` concatenation both allocate, so a device writes the
+    // whole part, a point and the fraction one piece at a time — which
+    // is why the sign is its own question.
+    let s = i2csample.sample(i2csample.I2C_Q_TEMPERATURE, 24500)
+    if s.valid
+        n = n + 1
+    if i2csample.whole(24500) == 24
+        n = n + 1
+    if i2csample.milli_fraction(-1500) == 500
+        n = n + 1
+    if i2csample.is_negative(-500)
+        n = n + 1
+    if not i2csample.no_sample(i2csample.I2C_Q_PRESSURE).valid
+        n = n + 1
+    if i2csample.in_range(s)
+        n = n + 1
+    if not i2csample.range_checked(i2csample.sample(i2csample.I2C_Q_TEMPERATURE,
+                                                    180000)).valid
+        n = n + 1
+    if i2csample.quantity_min(i2csample.I2C_Q_HUMIDITY) == 0
+        n = n + 1
+    if i2csample.quantity_max(i2csample.I2C_Q_HUMIDITY) >= 100000
+        n = n + 1
+    if str.len(i2csample.unit_name(i2csample.I2C_Q_PRESSURE)) > 0
+        n = n + 1
+    if str.len(i2csample.quantity_name(i2csample.I2C_Q_CURRENT)) > 0
+        n = n + 1
+
+    // The BME280's compensation, which is the largest piece of
+    // arithmetic in the package and the reason it is a `core` one.
+    let cfg = bme280.weather_monitoring()
+    if cfg.mode == bme280.BME280_MODE_FORCED
+        n = n + 1
+    if bme280.ctrl_hum_byte(cfg) == 0x01
+        n = n + 1
+    if bme280.ctrl_meas_byte(cfg) == 0x25
+        n = n + 1
+    if (bme280.config_byte(cfg) & 0x01) == 0
+        n = n + 1
+    if bme280.conversion_time(cfg).micros > 0
+        n = n + 1
+    if bme280.raw_is_reset(0x80000)
+        n = n + 1
+    let raw = bme280.raw_from(w)
+    if raw.ok
+        n = n + 1
+    if bme280.raw_status(raw) == i2cstatus.I2C_STATUS_OK
+        n = n + 1
+    let tcal = bme280.temp_cal_from(i2cbus.word(0x7011, 2))
+    let reading = bme280.compensate_temperature(tcal, 519888)
+    if reading.milli_c == 25080
+        n = n + 1
+    if reading.t_fine != 0
+        n = n + 1
+    let pcal = bme280.press_cal_from(i2cbus.word(0, 8), i2cbus.word(0, 8))
+    if not bme280.compensate_pressure(reading, pcal, 415148).press_valid
+        n = n + 1
+    let hcal = bme280.hum_cal_from(0x4b, i2cbus.word(0, 7))
+    if bme280.compensate_humidity(reading, hcal, 0xffff).milli_rh <= 100000
+        n = n + 1
+    let cal = bme280.no_calibration()
+    if not bme280.calibration_ok(cal)
+        n = n + 1
+    if not bme280.temperature(bme280.compensate(cal, raw)).valid
+        n = n + 1
+    if not bme280.pressure(bme280.compensate(cal, raw)).valid
+        n = n + 1
+    if not bme280.humidity(bme280.compensate(cal, raw)).valid
+        n = n + 1
+    if bme280.sea_level_pressure(101325, 0) == 101325
+        n = n + 1
+    if bme280.config(1, 1, 1, 0, 1).mode == bme280.BME280_MODE_FORCED
+        n = n + 1
+    if bme280.humidity_sensing().osrs_p == bme280.BME280_OVERSAMPLE_SKIP
+        n = n + 1
+    if bme280.indoor_navigation().mode == bme280.BME280_MODE_NORMAL
+        n = n + 1
+
+    // The Sensirion checksum, bit by bit, with no table: a table costs a
+    // quarter of a kilobyte of flash and an allocation to build, and a
+    // reply is three words.
+    if sht3x.crc8(0xbe, 0xef) == 0x92
+        n = n + 1
+    if sht3x.crc_ok(0xbe, 0xef, 0x92)
+        n = n + 1
+    if sht3x.measure_command(sht3x.SHT3X_REPEATABILITY_HIGH) == 0x2400
+        n = n + 1
+    if sht3x.conversion_time(sht3x.SHT3X_REPEATABILITY_HIGH).micros == 15500
+        n = n + 1
+    if sht3x.humidity_of(0xffff) == 100000
+        n = n + 1
+    if sht3x.temperature_of(0) == -45000
+        n = n + 1
+    let reply = sht3x.reply_from(i2cbus.word(0x6666926666ff, 6))
+    if not sht3x.reply_ok(reply)
+        n = n + 1
+    if sht3x.reply_status(reply) == i2cstatus.I2C_STATUS_CRC
+        n = n + 1
+    let shtr = sht3x.reading_of(reply)
+    if not shtr.valid
+        n = n + 1
+    if not sht3x.temperature(shtr).valid
+        n = n + 1
+    if not sht3x.humidity(shtr).valid
+        n = n + 1
+    if sht3x.dew_point(shtr) <= shtr.milli_c
+        n = n + 1
+    if sht3x.status_was_reset(sht3x.SHT3X_STATUS_RESET_DETECTED)
+        n = n + 1
+    if not sht3x.status_heater_on(0)
+        n = n + 1
+    if str.len(sht3x.status_name(0)) > 0
+        n = n + 1
+
+    // The light sensor's ceiling, which is the reading that looks like a
+    // measurement and is the part saying it cannot see any further.
+    if bh1750.is_saturated(bh1750.BH1750_RAW_SATURATED)
+        n = n + 1
+    if bh1750.oneshot_command(bh1750.BH1750_MODE_HIGH) == 0x20
+        n = n + 1
+    if bh1750.conversion_time(bh1750.BH1750_MODE_HIGH).micros > 0
+        n = n + 1
+    let slow_us = bh1750.conversion_time_at(bh1750.BH1750_MODE_HIGH,
+                                            bh1750.BH1750_MT_MAX).micros
+    let base_us = bh1750.conversion_time(bh1750.BH1750_MODE_HIGH).micros
+    if slow_us > base_us
+        n = n + 1
+    if bh1750.mt_is_valid(bh1750.BH1750_MT_DEFAULT)
+        n = n + 1
+    if not bh1750.mt_is_valid(255)
+        n = n + 1
+    if (bh1750.mt_high_byte(bh1750.BH1750_MT_DEFAULT) & 0xe0) == 0x40
+        n = n + 1
+    if (bh1750.mt_low_byte(bh1750.BH1750_MT_DEFAULT) & 0xe0) == 0x60
+        n = n + 1
+    let hi_ceil = bh1750.ceiling_milli_lux(bh1750.BH1750_MODE_HIGH,
+                                           bh1750.BH1750_MT_MIN)
+    let lo_ceil = bh1750.ceiling_milli_lux(bh1750.BH1750_MODE_HIGH,
+                                           bh1750.BH1750_MT_DEFAULT)
+    if hi_ceil > lo_ceil
+        n = n + 1
+    if bh1750.milli_lux_of(1200, bh1750.BH1750_MODE_HIGH, bh1750.BH1750_MT_DEFAULT) > 0
+        n = n + 1
+    let light = bh1750.reading_of(i2cbus.word(0xffff, 2), bh1750.BH1750_MODE_HIGH,
+                                  bh1750.BH1750_MT_DEFAULT)
+    if light.saturated
+        n = n + 1
+    if not bh1750.illuminance(light).valid
+        n = n + 1
+    if bh1750.reading_status(light) == i2cstatus.I2C_STATUS_SATURATED
+        n = n + 1
+
+    // The current monitor, whose current register reads a clean zero
+    // until the calibration register is written.
+    let icfg = ina219.default_config()
+    if icfg.mode == ina219.INA219_MODE_BOTH_CONTINUOUS
+        n = n + 1
+    if ina219.config_from_word(ina219.config_word(icfg)).gain == icfg.gain
+        n = n + 1
+    if ina219.conversion_time(icfg).micros > 0
+        n = n + 1
+    if ina219.config(0, 0, 3, 3, 3).gain == ina219.INA219_PGA_40MV
+        n = n + 1
+    if ina219.gain_full_scale_uv(ina219.INA219_PGA_40MV) == 40000
+        n = n + 1
+    if ina219.gain_fits(ina219.INA219_PGA_320MV, 100, 3200000)
+        n = n + 1
+    if ina219.gain_for(100, 400000) == ina219.INA219_PGA_40MV
+        n = n + 1
+    if ina219.bus_uv_of(0x0678) == 3308000
+        n = n + 1
+    if ina219.shunt_uv_of(-1000) == -10000
+        n = n + 1
+    if ina219.bus_conversion_ready(ina219.INA219_BUS_CNVR)
+        n = n + 1
+    if not ina219.bus_overflow(0x0678)
+        n = n + 1
+    let ical = ina219.calibration(100, 3200000)
+    if ical.ok
+        n = n + 1
+    if ina219.current_ua_of(0, ical) == 0
+        n = n + 1
+    if ina219.power_uw_of(100, ical) > 0
+        n = n + 1
+    let ir = ina219.reading_of(1000, 0x0678, 0, 0, ina219.no_calibration())
+    if not ir.calibrated
+        n = n + 1
+    if not ina219.current(ir).valid
+        n = n + 1
+    if not ina219.power(ir).valid
+        n = n + 1
+    if ina219.voltage(ir).valid
+        n = n + 1
+    if ina219.reading_status(ir) == i2cstatus.I2C_STATUS_UNCALIBRATED
+        n = n + 1
+    if ina219.implied_power_uw(ir, 100) > 0
+        n = n + 1
+
+    n
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 92 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says HOW MANY it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 92
+        hal.uart.write("PASS: i2c-devices-embedded\n")
+    else
+        hal.uart.write("FAIL: i2c-devices-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        hal.timer.delay_ms(1000)

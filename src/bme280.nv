@@ -1,0 +1,583 @@
+// bme280.nv — Bosch's BME280 humidity, pressure and temperature
+// sensor, and the BMP280 that shares its address and most of its
+// register map.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// References are to BST-BME280-DS002, the part's own datasheet.
+//
+// THE COMPENSATION IS THE PART.  A BME280 does not answer a
+// temperature: it answers a twenty-bit number that means nothing
+// without the twenty-six bytes of factory calibration burned into the
+// part at manufacture, and turning the one into the other is fifteen
+// lines of integer arithmetic printed in § 4.2.3 and Appendix A.  Every
+// driver for this sensor is mostly that arithmetic, and it is pure —
+// which is why `compensate_temperature`, `compensate_pressure` and
+// `compensate_humidity` take values and return values, with no bus
+// anywhere near them, and why they are the part of this package that
+// links into firmware.
+//
+// TEMPERATURE IS COMPENSATED FIRST, ALWAYS.  § 4.2.3's temperature
+// routine produces an intermediate the datasheet calls `t_fine`, and
+// BOTH the pressure and the humidity routines need it: the part's
+// pressure and humidity readings are temperature-dependent and the
+// compensation is where that dependence is removed.  A driver that
+// compensates pressure without having compensated temperature from the
+// same measurement gets a pressure that is wrong by kilopascals and
+// looks like weather.  So `t_fine` is a published value that
+// `compensate_temperature` answers and the other two take, rather than
+// a hidden variable the caller cannot see they have forgotten.
+
+use i2cbus
+use i2ctiming
+
+// ── Addresses and identity ───────────────────────────────────────────
+
+// The address with the SDO pin tied to ground: 0x76 (§ 6.2).
+pub const BME280_ADDR_LOW = 0x76
+// The address with the SDO pin tied to the supply: 0x77 (§ 6.2).
+pub const BME280_ADDR_HIGH = 0x77
+
+// The identification register: 0xd0 (§ 5.3).
+pub const BME280_REG_ID = 0xd0
+// What a BME280 answers from the identification register: 0x60.
+pub const BME280_CHIP_ID = 0x60
+// What a BMP280 answers: 0x58.  Same address, same pinout, no humidity
+// sensor — and configuring one as the other succeeds, which is why
+// every entry point here checks.
+pub const BMP280_CHIP_ID = 0x58
+
+// ── The register map (§ 5.3) ─────────────────────────────────────────
+
+// The soft-reset register: 0xe0.  Writing `BME280_RESET_WORD` to it is
+// the same as a power-on reset (§ 5.4.2).
+pub const BME280_REG_RESET = 0xe0
+// The only value the reset register acts on: 0xb6.  Any other value is
+// ignored, silently.
+pub const BME280_RESET_WORD = 0xb6
+
+// The humidity oversampling register: 0xf2 (§ 5.4.3).
+pub const BME280_REG_CTRL_HUM = 0xf2
+// The status register: 0xf3 (§ 5.4.4).
+pub const BME280_REG_STATUS = 0xf3
+// The measurement control register: 0xf4 (§ 5.4.5).
+pub const BME280_REG_CTRL_MEAS = 0xf4
+// The configuration register: 0xf5 (§ 5.4.6).
+pub const BME280_REG_CONFIG = 0xf5
+// The first byte of the measurement block: 0xf7 (§ 5.4.7).
+pub const BME280_REG_PRESS_MSB = 0xf7
+// How many bytes the measurement block holds: 8, at 0xf7 to 0xfe.
+pub const BME280_DATA_BYTES = 8
+
+// The first calibration register: 0x88 (§ 4.2.2, table 16).
+pub const BME280_REG_CALIB00 = 0x88
+// The second calibration block: 0xe1 (§ 4.2.2, table 16).
+pub const BME280_REG_CALIB26 = 0xe1
+
+// The status register's "a measurement is running" bit: 0x08.
+pub const BME280_STATUS_MEASURING = 0x08
+// The status register's "the calibration image is being copied" bit:
+// 0x01.  Set for about two milliseconds after a reset, and a
+// calibration read during it answers zeros.
+pub const BME280_STATUS_IM_UPDATE = 0x01
+
+// ── Modes and oversampling (§ 5.4.5) ─────────────────────────────────
+
+// Sleep mode: nothing is measured and the part draws 0.1 µA.
+pub const BME280_MODE_SLEEP = 0
+// Forced mode: one measurement, then back to sleep by itself.  The mode
+// a battery-powered node uses, because the part is awake only for the
+// conversion.
+pub const BME280_MODE_FORCED = 1
+// Normal mode: measure, stand by, repeat, without being asked.
+pub const BME280_MODE_NORMAL = 3
+
+// Oversampling: skipped.  The register reads its reset value and
+// compensates to a number, which is why `I2cFaultResetValue` exists.
+pub const BME280_OVERSAMPLE_SKIP = 0
+// Oversampling ×1.
+pub const BME280_OVERSAMPLE_1 = 1
+// Oversampling ×2.
+pub const BME280_OVERSAMPLE_2 = 2
+// Oversampling ×4.
+pub const BME280_OVERSAMPLE_4 = 3
+// Oversampling ×8.
+pub const BME280_OVERSAMPLE_8 = 4
+// Oversampling ×16.
+pub const BME280_OVERSAMPLE_16 = 5
+
+// The IIR filter off (§ 3.4.4).  What a forced-mode reading wants: the
+// filter is a running average over successive measurements, and a part
+// that sleeps between them has none to average.
+pub const BME280_FILTER_OFF = 0
+// Filter coefficient 2.
+pub const BME280_FILTER_2 = 1
+// Filter coefficient 4.
+pub const BME280_FILTER_4 = 2
+// Filter coefficient 8.
+pub const BME280_FILTER_8 = 3
+// Filter coefficient 16.
+pub const BME280_FILTER_16 = 4
+
+// ── Configuration ────────────────────────────────────────────────────
+
+// What the part is asked to measure, and how hard.
+pub @value
+struct I2cBmeConfig
+    // Temperature oversampling, one of `BME280_OVERSAMPLE_*`.
+    osrs_t: Int
+    // Pressure oversampling.
+    osrs_p: Int
+    // Humidity oversampling.  Ignored by a BMP280, which has no
+    // humidity sensor.
+    osrs_h: Int
+    // The IIR filter coefficient, one of `BME280_FILTER_*`.
+    filter: Int
+    // One of `BME280_MODE_*`.
+    mode: Int
+
+// The datasheet's weather-monitoring settings (§ 3.5.1).
+//
+// Forced mode, oversampling ×1 on all three, filter off.  One
+// measurement every minute or less often, about nine milliseconds
+// awake, and 0.16 µA average.  The settings a sensor node on a coin
+// cell wants, and the default worth having.
+//
+// ```novo
+// use bme280
+//
+// fn main() [io]
+//     println("${bme280.weather_monitoring().mode}")   // 1, forced
+// ```
+pub @tier(embedded)
+fn weather_monitoring() -> I2cBmeConfig []
+    todo("i2c-devices-nv.bme280.weather_monitoring")
+
+// The datasheet's humidity-sensing settings (§ 3.5.2).
+//
+// Forced mode, pressure skipped, temperature and humidity ×1, filter
+// off.  For a node that wants humidity and uses the temperature only to
+// compensate it.
+pub @tier(embedded)
+fn humidity_sensing() -> I2cBmeConfig []
+    todo("i2c-devices-nv.bme280.humidity_sensing")
+
+// The datasheet's indoor-navigation settings (§ 3.5.3).
+//
+// Normal mode, pressure ×16, temperature ×2, humidity ×1, filter 16,
+// standby 0.5 ms.  633 µA, and the configuration that reaches the
+// part's 0.2 Pa resolution.  Not for a battery.
+pub @tier(embedded)
+fn indoor_navigation() -> I2cBmeConfig []
+    todo("i2c-devices-nv.bme280.indoor_navigation")
+
+// A configuration from its five fields.
+pub @tier(embedded)
+fn config(osrs_t: Int, osrs_p: Int, osrs_h: Int, filter: Int, mode: Int) -> I2cBmeConfig []
+    todo("i2c-devices-nv.bme280.config")
+
+// The byte this configuration writes to `ctrl_meas`.
+//
+// Oversampling for temperature in bits 7 to 5, for pressure in 4 to 2,
+// and the mode in 1 and 0 (§ 5.4.5).
+pub @tier(embedded)
+fn ctrl_meas_byte(c: I2cBmeConfig) -> Int []
+    todo("i2c-devices-nv.bme280.ctrl_meas_byte")
+
+// The byte this configuration writes to `ctrl_hum`.
+//
+// Humidity oversampling in bits 2 to 0, and nothing else in the
+// register (§ 5.4.3).
+pub @tier(embedded)
+fn ctrl_hum_byte(c: I2cBmeConfig) -> Int []
+    todo("i2c-devices-nv.bme280.ctrl_hum_byte")
+
+// The byte this configuration writes to `config`.
+//
+// The standby time in bits 7 to 5, the filter in 4 to 2, and the
+// three-wire SPI enable in bit 0, which this package always leaves
+// clear (§ 5.4.6).
+pub @tier(embedded)
+fn config_byte(c: I2cBmeConfig) -> Int []
+    todo("i2c-devices-nv.bme280.config_byte")
+
+// How long a measurement with this configuration takes.
+//
+// § 9.1's worst case: 1.25 ms of fixed overhead, 2.3 ms per temperature
+// oversample, 2.3 ms per pressure oversample plus 0.575 ms, and the
+// same again for humidity.  Nine and a bit milliseconds at the
+// weather-monitoring settings, and forty at ×16 on everything.
+//
+// ```novo
+// use bme280
+// use i2ctiming
+//
+// fn main() [io]
+//     let c = bme280.conversion_time(bme280.weather_monitoring())
+//     println("${i2ctiming.conversion_millis_ceil(c)}")   // 10
+// ```
+pub @tier(embedded)
+fn conversion_time(c: I2cBmeConfig) -> I2cConversion []
+    todo("i2c-devices-nv.bme280.conversion_time")
+
+// ── The calibration ──────────────────────────────────────────────────
+//
+// Three values rather than one struct of eighteen fields, because the
+// three compensation routines need three disjoint sets and a `@value`
+// struct is copied whole on every call.  A caller reads all three once
+// and passes each where it belongs.
+
+// The three temperature coefficients (§ 4.2.2, dig_T1 to dig_T3).
+pub @value
+struct I2cBmeTempCal
+    // dig_T1, unsigned.
+    t1: Int
+    // dig_T2, signed.
+    t2: Int
+    // dig_T3, signed.
+    t3: Int
+
+// The nine pressure coefficients (§ 4.2.2, dig_P1 to dig_P9).
+pub @value
+struct I2cBmePressCal
+    // dig_P1, unsigned.
+    p1: Int
+    // dig_P2 to dig_P9, all signed.
+    p2: Int
+    p3: Int
+    p4: Int
+    p5: Int
+    p6: Int
+    p7: Int
+    p8: Int
+    p9: Int
+
+// The six humidity coefficients (§ 4.2.2, dig_H1 to dig_H6).
+//
+// dig_H4 AND dig_H5 SHARE A BYTE.  They are twelve bits each, packed
+// into the five bytes at 0xe4 to 0xe6 with the two nibbles of 0xe5
+// holding the bottom of dig_H4 and the bottom of dig_H5 — the low
+// nibble for dig_H4 and the high nibble for dig_H5.  Nothing else in
+// the calibration block is packed like that, and reading 0xe5 as a
+// whole byte for either of them is the single most common mistake in a
+// hand-written BME280 driver.  The symptom is a humidity that tracks
+// the real one and is out by tens of percent.
+pub @value
+struct I2cBmeHumCal
+    // dig_H1, unsigned, one byte at 0xa1.
+    h1: Int
+    // dig_H2, signed, two bytes at 0xe1.
+    h2: Int
+    // dig_H3, unsigned, one byte at 0xe3.
+    h3: Int
+    // dig_H4, signed, twelve bits from 0xe4 and the low nibble of 0xe5.
+    h4: Int
+    // dig_H5, signed, twelve bits from 0xe6 and the high nibble of 0xe5.
+    h5: Int
+    // dig_H6, signed, one byte at 0xe7.
+    h6: Int
+
+// All three, and whether they were read.
+pub @value
+struct I2cBmeCalib
+    // The temperature coefficients.
+    temp: I2cBmeTempCal
+    // The pressure coefficients.
+    press: I2cBmePressCal
+    // The humidity coefficients.  Zero throughout on a BMP280.
+    hum: I2cBmeHumCal
+    // Whether every calibration read completed.  Compensating with a
+    // calibration that is not `ok` produces a plausible number, which
+    // is why `compensate_*` refuses instead.
+    ok: Bool
+    // Whether this part has a humidity sensor.  False for a BMP280.
+    has_humidity: Bool
+
+// The temperature coefficients from the first eight calibration bytes.
+//
+// `w` is the eight bytes read from 0x88.  LITTLE-ENDIAN: the
+// calibration block stores every multi-byte coefficient least
+// significant byte first, and the measurement registers store their
+// values most significant byte first (§ 4.2.2 against § 5.4.7).  One
+// driver reading both the same way is the other classic BME280 bug.
+pub @tier(embedded)
+fn temp_cal_from(w: I2cWord) -> I2cBmeTempCal []
+    todo("i2c-devices-nv.bme280.temp_cal_from")
+
+// The pressure coefficients from calibration bytes at 0x8e and 0x96.
+//
+// Two words because eighteen bytes do not fit in one: `lo` is the eight
+// bytes from 0x8e and `hi` the eight from 0x96, in the order they came
+// off the bus.
+pub @tier(embedded)
+fn press_cal_from(lo: I2cWord, hi: I2cWord) -> I2cBmePressCal []
+    todo("i2c-devices-nv.bme280.press_cal_from")
+
+// The humidity coefficients from dig_H1 and the seven bytes at 0xe1.
+//
+// `h1` is the single byte read from 0xa1, and `w` the seven bytes from
+// 0xe1 to 0xe7.  The nibble unpacking of dig_H4 and dig_H5 happens
+// here.
+pub @tier(embedded)
+fn hum_cal_from(h1: Int, w: I2cWord) -> I2cBmeHumCal []
+    todo("i2c-devices-nv.bme280.hum_cal_from")
+
+// A calibration that was not read: every coefficient zero, not ok.
+pub @tier(embedded)
+fn no_calibration() -> I2cBmeCalib []
+    todo("i2c-devices-nv.bme280.no_calibration")
+
+// Whether a calibration is usable.
+//
+// False when a read failed, and false when dig_T1 or dig_P1 is zero: an
+// unprogrammed or half-copied calibration image reads as zeros, dig_P1
+// is a divisor in § 4.2.3's pressure routine, and dividing by it is how
+// a driver discovers the image was not ready two milliseconds after
+// reset.
+pub @tier(embedded)
+fn calibration_ok(c: I2cBmeCalib) -> Bool []
+    todo("i2c-devices-nv.bme280.calibration_ok")
+
+// ── A raw measurement ────────────────────────────────────────────────
+
+// The three numbers the measurement block holds, uncompensated.
+//
+// Meaningless on their own: the datasheet's own example temperature is
+// 519888, which is neither degrees nor anything else until § 4.2.3 has
+// been applied to it with this part's coefficients.
+pub @value
+struct I2cBmeRaw
+    // Twenty bits from 0xf7 to 0xf9.  0x80000 when pressure
+    // oversampling is skipped or no measurement has completed.
+    press: Int
+    // Twenty bits from 0xfa to 0xfc.  0x80000 for the same reasons.
+    temp: Int
+    // Sixteen bits from 0xfd and 0xfe.  0x8000 on a BMP280 and when
+    // humidity oversampling is skipped.
+    hum: Int
+    // Whether the block was read.
+    ok: Bool
+
+// The raw measurement from the eight-byte block at 0xf7.
+//
+// READ AS ONE BURST, ALWAYS.  § 4 says so and the reason is a race the
+// caller cannot see: in normal mode the part can finish a new
+// measurement between two single-register reads, so three bytes come
+// from one conversion and three from the next.  The result is a
+// pressure that is composed of two real pressures and is not either of
+// them, appearing perhaps once an hour.
+pub @tier(embedded)
+fn raw_from(w: I2cWord) -> I2cBmeRaw []
+    todo("i2c-devices-nv.bme280.raw_from")
+
+// Whether a raw field is the register's reset value rather than a
+// measurement.
+//
+// 0x80000 for pressure and temperature, 0x8000 for humidity.  The check
+// that turns "this part was never configured" into a refusal instead of
+// a pressure of 1131 hPa.
+//
+// ```novo
+// use bme280
+//
+// fn main() [io]
+//     println("${bme280.raw_is_reset(0x80000)}")   // true
+// ```
+pub @tier(embedded)
+fn raw_is_reset(raw: Int) -> Bool []
+    todo("i2c-devices-nv.bme280.raw_is_reset")
+
+// The `i2cstatus` code this raw block carries.
+//
+// `I2C_STATUS_ADDRESS_NAK` for a block that was not read,
+// `I2C_STATUS_RESET_VALUE` for one whose registers hold their reset
+// values, and `I2C_STATUS_OK` otherwise.
+pub @tier(embedded)
+fn raw_status(r: I2cBmeRaw) -> Int []
+    todo("i2c-devices-nv.bme280.raw_status")
+
+// ── The compensation (§ 4.2.3 and Appendix A) ────────────────────────
+
+// A compensated reading, and the intermediate the other two routines
+// need.
+pub @value
+struct I2cBmeReading
+    // Temperature in thousandths of a degree Celsius.
+    milli_c: Int
+    // Pressure in pascals.
+    pascals: Int
+    // Relative humidity in thousandths of a percent.
+    milli_rh: Int
+    // § 4.2.3's `t_fine`: the temperature in a resolution the pressure
+    // and humidity routines consume.  Published because it is the
+    // coupling between the three, and a reading that carries it can be
+    // recompensated later against a corrected calibration.
+    t_fine: Int
+    // Whether the temperature was compensated.
+    temp_valid: Bool
+    // Whether the pressure was compensated.
+    press_valid: Bool
+    // Whether the humidity was compensated.  False on a BMP280.
+    hum_valid: Bool
+
+// Compensate the temperature, and answer `t_fine` with it.
+//
+// § 4.2.3's `BME280_compensate_T_int32`, which answers hundredths of a
+// degree; this scales to thousandths, the unit `i2csample` uses.  The
+// datasheet's own worked example is a raw value of 519888 against the
+// example coefficients giving 25.08 °C.
+//
+// THE FIRST CALL, ALWAYS.  Neither of the other two routines is correct
+// without the `t_fine` this produces.
+pub @tier(embedded)
+fn compensate_temperature(cal: I2cBmeTempCal, raw_temp: Int) -> I2cBmeReading []
+    todo("i2c-devices-nv.bme280.compensate_temperature")
+
+// Compensate the pressure into the reading that carries `t_fine`.
+//
+// § 4.2.3's `BME280_compensate_P_int64`, which answers pressure in
+// Q24.8 pascals; this answers whole pascals.  The datasheet's worked
+// example is a raw value of 415148 giving 100653 Pa.
+//
+// ANSWERS THE READING UNCHANGED, WITH `press_valid` FALSE, when the
+// reading's temperature was not compensated or when dig_P1 is zero.
+// The sixty-four-bit routine divides by a term built from dig_P1, and a
+// calibration image read too soon after reset is all zeros.
+pub @tier(embedded)
+fn compensate_pressure(r: I2cBmeReading, cal: I2cBmePressCal, raw_press: Int) -> I2cBmeReading []
+    todo("i2c-devices-nv.bme280.compensate_pressure")
+
+// Compensate the humidity into the reading that carries `t_fine`.
+//
+// § 4.2.3's `bme280_compensate_H_int32`, which answers Q22.10 percent;
+// this answers thousandths of a percent.  The result is CLAMPED to 0
+// and 100 percent by the datasheet's own routine, so a saturated sensor
+// reads 100.000 rather than more.
+pub @tier(embedded)
+fn compensate_humidity(r: I2cBmeReading, cal: I2cBmeHumCal, raw_hum: Int) -> I2cBmeReading []
+    todo("i2c-devices-nv.bme280.compensate_humidity")
+
+// All three, in the order the datasheet requires.
+//
+// The call a driver makes, and the one that cannot get the ordering
+// wrong.  A calibration that is not ok answers a reading with all three
+// validity flags clear.
+//
+// ```novo
+// use bme280
+//
+// fn main() [io]
+//     let r = bme280.compensate(bme280.no_calibration(),
+//                               bme280.raw_from(i2cbus.word_failed()))
+//     println("${r.temp_valid}")   // false
+// ```
+pub @tier(embedded)
+fn compensate(cal: I2cBmeCalib, raw: I2cBmeRaw) -> I2cBmeReading []
+    todo("i2c-devices-nv.bme280.compensate")
+
+// The temperature as a sample, or an invalid one.
+pub @tier(embedded)
+fn temperature(r: I2cBmeReading) -> I2cSample []
+    todo("i2c-devices-nv.bme280.temperature")
+
+// The pressure as a sample, or an invalid one.
+pub @tier(embedded)
+fn pressure(r: I2cBmeReading) -> I2cSample []
+    todo("i2c-devices-nv.bme280.pressure")
+
+// The relative humidity as a sample, or an invalid one.
+pub @tier(embedded)
+fn humidity(r: I2cBmeReading) -> I2cSample []
+    todo("i2c-devices-nv.bme280.humidity")
+
+// Pressure at sea level from a measured pressure and a known altitude,
+// in pascals.
+//
+// The number a weather station reports, because a pressure that is not
+// corrected for altitude cannot be compared with anybody else's.  The
+// international barometric formula, with the altitude in metres.
+//
+// NOT THE INVERSE.  Computing altitude from pressure needs the sea
+// level pressure of the day, which no sensor knows, and a driver that
+// offers an `altitude()` using a fixed 101325 Pa answers a number that
+// moves thirty metres with the weather.
+pub @tier(embedded)
+fn sea_level_pressure(pascals: Int, altitude_m: Int) -> Int []
+    todo("i2c-devices-nv.bme280.sea_level_pressure")
+
+// ── Over a bus ───────────────────────────────────────────────────────
+
+// Whether a BME280 or a BMP280 answers at this address, and which.
+//
+// Answers `BME280_CHIP_ID`, `BMP280_CHIP_ID`, or -1 for nothing and for
+// anything else.
+pub fn identify<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Int [e]
+    todo("i2c-devices-nv.bme280.identify")
+
+// Reset the part and wait for nothing.
+//
+// Writes `BME280_RESET_WORD` to 0xe0.  The caller must then wait about
+// two milliseconds before reading the calibration, because the part
+// copies its calibration image out of non-volatile memory during that
+// window and answers zeros while `BME280_STATUS_IM_UPDATE` is set.
+// `is_calibration_ready` is the question; this function does not ask it.
+pub fn reset<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
+    todo("i2c-devices-nv.bme280.reset")
+
+// Whether the part has finished copying its calibration image.
+pub fn is_calibration_ready<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
+    todo("i2c-devices-nv.bme280.is_calibration_ready")
+
+// Read the whole calibration.
+//
+// FIVE TRANSACTIONS, because thirty-three bytes do not fit in the
+// eight-byte word a transfer answers: 0x88, 0x90 and 0x98 for eight
+// bytes each, 0xa0 for two, and 0xe1 for seven.  Read ONCE at startup
+// and kept; a driver that re-read it per measurement would spend more
+// bus time on coefficients than on data.
+pub fn read_calibration<B: I2cDeviceBus[e]>(b: B, addr: Int) -> I2cBmeCalib [e]
+    todo("i2c-devices-nv.bme280.read_calibration")
+
+// Apply a configuration.
+//
+// WRITES `ctrl_hum` BEFORE `ctrl_meas`, and that order is the whole
+// reason this function exists.  § 5.4.3: "changes to this register only
+// become effective after a write operation to `ctrl_meas`".  A driver
+// that writes them the other way round leaves humidity oversampling at
+// whatever it was — which after a reset is skipped — so the humidity
+// register reads its reset value, compensates to a number, and the
+// program reports a humidity that never changes.
+//
+// The `config` register is written first of all, because § 5.4.6 says
+// writes to it may be ignored in normal mode and the part is in sleep
+// mode until `ctrl_meas` sets otherwise.
+pub fn configure<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cBmeConfig) -> Bool [e]
+    todo("i2c-devices-nv.bme280.configure")
+
+// Trigger one forced-mode measurement and answer how long it takes.
+//
+// Writes the configuration with the mode forced to `BME280_MODE_FORCED`
+// and answers its conversion time.  The caller waits that long and
+// calls `read_raw` with how long it waited.
+pub fn start_measurement<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cBmeConfig) -> I2cConversion [e]
+    todo("i2c-devices-nv.bme280.start_measurement")
+
+// Whether a measurement is still running.
+//
+// The status register's bit 3.  An alternative to timing the wait, for
+// a caller that would rather poll a register than hold a deadline —
+// and a second transaction either way, which is why the conversion time
+// is the recommended path on a node that is asleep during it.
+pub fn is_measuring<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
+    todo("i2c-devices-nv.bme280.is_measuring")
+
+// Read the eight-byte measurement block, refusing a read that is too
+// early.
+//
+// `waited_micros` is how long the caller waited since
+// `start_measurement`, and `c` is the conversion that call answered.  A
+// short wait answers a raw block that is not ok rather than the
+// previous measurement.
+pub fn read_raw<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cConversion,
+                                    waited_micros: Int) -> I2cBmeRaw [e]
+    todo("i2c-devices-nv.bme280.read_raw")

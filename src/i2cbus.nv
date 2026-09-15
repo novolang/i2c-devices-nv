@@ -1,0 +1,282 @@
+// i2cbus.nv — the bus this package is written over, and the word a
+// transfer answers.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `I2cDeviceBus[e]` IS THE TRAIT THAT CROSSES THE LAYER, and this
+// package implements it nowhere.  `e` is the effect row the
+// implementation supplies: `[hw]` for a peripheral on a
+// microcontroller, `[fs, ffi]` for a Linux `/dev/i2c-N` device behind a
+// binding, and NOTHING for a table of recorded bytes in a test.  Every
+// function written over the trait costs what its argument costs
+// (SPEC § 5.6), which is why this package declares no effect of its own.
+//
+// A TRANSFER ANSWERS UP TO EIGHT BYTES IN ONE INTEGER, and that is
+// arithmetic rather than a trick.  An `Int` is sixty-four bits, eight
+// bytes is sixty-four bits, and the longest burst any part in this
+// package needs is the BME280's eight-byte measurement block.  So a
+// whole burst is one integer in the caller's stack frame: no list, no
+// allocation, and a driver that runs from an interrupt handler on a
+// part with sixty-four kilobytes of RAM.
+//
+// A READ IS ONE TRANSACTION, NOT TWO.  Every register read here is
+// "write the register pointer, repeated START, read N bytes" in a
+// single bus transaction.  Two transactions with a STOP between them
+// release the bus, and on a bus with a second master the pointer a
+// driver wrote can be moved by somebody else before the read happens —
+// so the part answers from a register nobody asked about, correctly,
+// with no error anywhere.  `i2c_read` is therefore a primitive rather
+// than a convenience over `i2c_write` and a separate read.
+
+// ── Addresses ────────────────────────────────────────────────────────
+
+// The lowest address a part may use: 0x08.
+//
+// The I2C specification (UM10204 § 3.1.12) reserves 0x00 to 0x07 for
+// general call, CBUS and other bus-level functions.
+pub const I2C_ADDR_MIN = 0x08
+
+// The highest address a part may use: 0x77.
+//
+// 0x78 to 0x7f are reserved for ten-bit addressing and device ID.
+pub const I2C_ADDR_MAX = 0x77
+
+// Whether an address is one a part may answer on.
+//
+// ```novo
+// use i2cbus
+//
+// fn main() [io]
+//     println("${i2cbus.addr_is_valid(0x76)}")   // true
+//     println("${i2cbus.addr_is_valid(0x00)}")   // false, it is reserved
+// ```
+pub @tier(embedded)
+fn addr_is_valid(addr: Int) -> Bool []
+    todo("i2c-devices-nv.i2cbus.addr_is_valid")
+
+// The seven-bit address a datasheet's eight-bit "write address" means.
+//
+// Datasheets disagree with each other about which of the two numbers
+// they print, and the eight-bit form is the seven-bit address shifted
+// up with the read/write bit in the bottom — so a BME280 at 0x76 is
+// printed as 0xec in Bosch's tables and as 0x76 in every driver.  A
+// program that uses the printed number addresses nothing, and the
+// symptom is an address NAK on a part that is soldered down correctly.
+//
+// ```novo
+// use i2cbus
+//
+// fn main() [io]
+//     println("${i2cbus.addr_from_write_byte(0xec)}")   // 118, which is 0x76
+// ```
+pub @tier(embedded)
+fn addr_from_write_byte(write_byte: Int) -> Int []
+    todo("i2c-devices-nv.i2cbus.addr_from_write_byte")
+
+// The eight-bit write address a datasheet prints for this part.
+//
+// The inverse of `addr_from_write_byte`, for a reader checking a wiring
+// diagram against their code.
+pub @tier(embedded)
+fn write_byte_of_addr(addr: Int) -> Int []
+    todo("i2c-devices-nv.i2cbus.write_byte_of_addr")
+
+// ── What a transfer answers ──────────────────────────────────────────
+
+// Up to eight bytes, and whether the transfer completed.
+//
+// THE WORD CARRIES ITS OWN REFUSAL.  A `@value` struct cannot be an
+// optional or a `Result` payload (E2015), and a read has to be
+// answerable from an interrupt with nothing on a heap — so `ok` is the
+// status and `i2cbus.word_status` turns a refusal into a code `i2cfault` can name.
+//
+// AND A SENTINEL WOULD BE WRONG HERE RATHER THAN MERELY UGLY.  An
+// eight-byte read fills all sixty-four bits, so every integer is a
+// legal answer; -1 is all ones, which is exactly what a bus with no
+// pull-up resistors reads back.  A driver that treated it as "failed"
+// would be right for the wrong reason on a broken board and wrong on a
+// working one.
+pub @value
+struct I2cWord
+    // The bytes received, most significant byte first: the first byte
+    // off the bus is the highest of the `count` bytes.  Bits above
+    // `count * 8` are zero.
+    bits: Int
+    // How many bytes `bits` holds, 0 to 8.
+    count: Int
+    // Whether the transaction completed and every byte was received.
+    ok: Bool
+
+// A word from bytes already in hand, for a test or a replayed capture.
+//
+// ```novo
+// use i2cbus
+//
+// fn main() [io]
+//     println("${i2cbus.word(0x6085, 2).count}")   // 2
+// ```
+pub @tier(embedded)
+fn word(bits: Int, count: Int) -> I2cWord []
+    todo("i2c-devices-nv.i2cbus.word")
+
+// The word a failed transfer answers: no bytes, not ok.
+pub @tier(embedded)
+fn word_failed() -> I2cWord []
+    todo("i2c-devices-nv.i2cbus.word_failed")
+
+// Whether the transfer completed.
+pub @tier(embedded)
+fn word_ok(w: I2cWord) -> Bool []
+    todo("i2c-devices-nv.i2cbus.word_ok")
+
+// The `i2cstatus` code this word carries.
+//
+// `I2C_STATUS_OK` for a completed transfer, `I2C_STATUS_ADDRESS_NAK`
+// otherwise: from the bus's point of view a transfer either happened or
+// nobody answered, and every finer diagnosis belongs to the part.
+pub @tier(embedded)
+fn word_status(w: I2cWord) -> Int []
+    todo("i2c-devices-nv.i2cbus.word_status")
+
+// Byte `i` of the word, counting from the first byte off the bus.
+//
+// Answers 0 for an index past `count`, which is the same answer a zero
+// byte gives — `word_ok` and `count` are the questions that distinguish
+// them, and this function does not pretend to.
+//
+// ```novo
+// use i2cbus
+//
+// fn main() [io]
+//     println("${i2cbus.byte_at(i2cbus.word(0x6085, 2), 0)}")   // 96, which is 0x60
+// ```
+pub @tier(embedded)
+fn byte_at(w: I2cWord, i: Int) -> Int []
+    todo("i2c-devices-nv.i2cbus.byte_at")
+
+// Two bytes at `i` read most significant byte first, unsigned.
+//
+// The order the measurement registers of every part in this package
+// use.  `le_u16_at` is the other order, and the BME280's calibration
+// block is in it — see the note there.
+pub @tier(embedded)
+fn be_u16_at(w: I2cWord, i: Int) -> Int []
+    todo("i2c-devices-nv.i2cbus.be_u16_at")
+
+// Two bytes at `i` read most significant byte first, as a signed
+// sixteen-bit value.
+//
+// A signed reading is negative for roughly half the range a sensor
+// reports, and reading it unsigned turns -1 into 65535 — a number that
+// is large rather than obviously wrong, which is why it survives
+// review.
+pub @tier(embedded)
+fn be_i16_at(w: I2cWord, i: Int) -> Int []
+    todo("i2c-devices-nv.i2cbus.be_i16_at")
+
+// Two bytes at `i` read LEAST significant byte first, unsigned.
+//
+// The BME280 stores its compensation coefficients this way and its
+// measurements the other way (BST-BME280-DS002 § 4.2.2 against § 5.4.1).
+// One driver reading both orders the same way compensates real
+// measurements with byte-swapped coefficients, and the result is a
+// temperature that moves in the right direction and is wrong by tens of
+// degrees.
+pub @tier(embedded)
+fn le_u16_at(w: I2cWord, i: Int) -> Int []
+    todo("i2c-devices-nv.i2cbus.le_u16_at")
+
+// Two bytes at `i` read least significant byte first, as a signed
+// sixteen-bit value.
+pub @tier(embedded)
+fn le_i16_at(w: I2cWord, i: Int) -> Int []
+    todo("i2c-devices-nv.i2cbus.le_i16_at")
+
+// Three bytes at `i` as a twenty-bit measurement, most significant byte
+// first.
+//
+// The BME280 reports pressure and temperature as twenty bits spread
+// over three registers, with the bottom four bits of the third byte
+// unused (BST-BME280-DS002 § 4.2.2).  A driver that read three bytes as
+// twenty-four bits gets a number sixteen times too large.
+pub @tier(embedded)
+fn be_u20_at(w: I2cWord, i: Int) -> Int []
+    todo("i2c-devices-nv.i2cbus.be_u20_at")
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+// An I2C bus, on a peripheral or behind a recorded capture.
+//
+// SEVEN-BIT ADDRESSES throughout: `addr` is 0x08 to 0x77, never the
+// eight-bit form a datasheet prints.  `addr_from_write_byte` converts.
+pub trait I2cDeviceBus[e]
+    // Write one byte to one register, in one transaction.  Answers
+    // whether every byte was acknowledged.
+    fn i2c_write_reg(self, addr: Int, reg: Int, val: Int) -> Bool [e]
+    // Write the register pointer, repeated START, read `n` bytes — ONE
+    // transaction, for the reason in the module comment.  `n` is 1 to 8.
+    fn i2c_read_reg(self, addr: Int, reg: Int, n: Int) -> I2cWord [e]
+    // Write up to four bytes with no register pointer at all.
+    //
+    // Sensirion parts have no register map: a command is a sixteen-bit
+    // word written straight after the address, and a read follows with
+    // no pointer.  `len` is how many of `bytes`'s low bytes to send,
+    // most significant of those first.
+    fn i2c_write_raw(self, addr: Int, bytes: Int, len: Int) -> Bool [e]
+    // Read `n` bytes with no register pointer.  The other half of a
+    // Sensirion exchange.  `n` is 1 to 8.
+    fn i2c_read_raw(self, addr: Int, n: Int) -> I2cWord [e]
+    // Whether anything acknowledges this address.
+    //
+    // A zero-length write, which is the only probe that is safe against
+    // a part whose register map is unknown: reading from an arbitrary
+    // pointer can trigger a measurement, clear a status bit or, on an
+    // EEPROM, start a write cycle.
+    fn i2c_present(self, addr: Int) -> Bool [e]
+    // The bus frequency in hertz, as configured.  Answered without
+    // performing anything, because it is a number a driver reads once
+    // to decide whether a part's maximum has been exceeded.
+    fn i2c_frequency(self) -> Int
+
+// ── Driving one ──────────────────────────────────────────────────────
+
+// Read a register and answer an `i2cstatus` code rather than a word.
+//
+// `[e]`, so the cost is the bus's.  For a driver that is performing a
+// transfer for its side effect — a configuration write read back, a
+// pointer set — and has nothing to do with the bytes.
+pub fn read_reg_checked<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int, n: Int) -> Int [e]
+    todo("i2c-devices-nv.i2cbus.read_reg_checked")
+
+// Read one register byte, or -1 when the transfer did not complete.
+//
+// The convenience an identification check wants, where the value is one
+// byte and the only thing to do about a failure is to give up.
+pub fn read_byte<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int) -> Int [e]
+    todo("i2c-devices-nv.i2cbus.read_byte")
+
+// Set and clear bits of one register, reading it first.
+//
+// The operation a configuration register needs and the one nobody
+// writes correctly by hand: a part whose control register holds three
+// unrelated fields loses two of them to a driver that writes the whole
+// byte.  `set` is ORed in and `clear` is masked out, `clear` first.
+pub fn update_reg<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int, clear: Int, set: Int) -> Bool [e]
+    todo("i2c-devices-nv.i2cbus.update_reg")
+
+// The next address at or after `from` that answers, or -1.
+//
+// COSTS ONE TRANSACTION PER ADDRESS TRIED, up to 112 for a whole bus,
+// and the number is here rather than hidden because a scan on a
+// battery-powered node is a measurable amount of charge.  A caller that
+// knows its parts should not scan at all.
+pub fn scan_next<B: I2cDeviceBus[e]>(b: B, from: Int) -> Int [e]
+    todo("i2c-devices-nv.i2cbus.scan_next")
+
+// Whether the part at `addr` identifies itself as `expected`.
+//
+// `reg` is the part's identification register.  The check every driver
+// in this package makes before it writes anything: three different
+// parts share 0x76, and configuring the wrong one succeeds.
+pub fn chip_is<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int, expected: Int) -> Bool [e]
+    todo("i2c-devices-nv.i2cbus.chip_is")

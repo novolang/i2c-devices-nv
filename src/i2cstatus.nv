@@ -1,0 +1,140 @@
+// i2cstatus.nv — the seven ways a reading does not arrive, as codes a
+// device can carry, and which of them a retry can fix.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  Nothing here
+// touches a bus and nothing here allocates.
+//
+// A CODE ON THE DEVICE, A FAULT ON THE HOST.  `i2cfault` declares an
+// enum whose variants carry the address, the two checksums or the raw
+// word, which is the shape a program wants in a log — and a
+// payload-carrying enum variant is a heap value, which
+// `@tier(embedded)` refuses (SPEC § 12.4).  So a driver running in
+// firmware answers one of these integers, every value in this package
+// that can refuse carries one, and `i2cfault.fault_of` is the one
+// function that turns a code into a fault.  A firmware build never
+// reaches it, and a host program never sees the integer.
+//
+// A DRIVER'S FAILURES ARE NOT ONE FAILURE.  The two that a caller most
+// often collapses into "the sensor is broken" have opposite repairs: an
+// address that does not answer is a wiring problem and no amount of
+// retrying changes it, while a part that refused a byte because it is
+// still converting answers correctly the moment the caller waits.  A
+// driver that reported one code for both makes a program that either
+// retries a disconnected sensor forever or gives up on a working one.
+
+// Nothing is wrong.
+pub const I2C_STATUS_OK = 0
+
+// Nothing acknowledged the address byte.  The part is not on this bus
+// at this address: a missing pull-up resistor, an ADDR pin wired the
+// other way, or the wrong bus entirely.  Never transient.
+pub const I2C_STATUS_ADDRESS_NAK = 1
+
+// The part acknowledged its address and then refused a byte.  On
+// Sensirion parts this is also how "the measurement is not finished"
+// reads, which is why `sht3x` converts it rather than passing it on.
+pub const I2C_STATUS_DATA_NAK = 2
+
+// A reply's check byte disagreed with the bytes it covers.  One
+// corrupted transfer on a bus with long wires or a weak pull-up.
+pub const I2C_STATUS_CRC = 3
+
+// Something answered at the address and it is not the expected part.
+// 0x76 and 0x77 are shared by the BME280, the BMP280 and the MS5611,
+// and only the identification register tells them apart — so a program
+// that skipped the check reads a BMP280's registers as a BME280's and
+// reports a humidity the part cannot measure.
+pub const I2C_STATUS_WRONG_CHIP = 4
+
+// A measurement was read before its conversion time had elapsed.
+pub const I2C_STATUS_NOT_READY = 5
+
+// A compensated value was asked for from a calibration that was never
+// read or never written.  The BME280's coefficients live in the part
+// and the INA219's divisor is the host's to program; without either,
+// compensating produces a number rather than a refusal.
+pub const I2C_STATUS_UNCALIBRATED = 6
+
+// A raw word is the register's reset value rather than a measurement.
+// The BME280's pressure and temperature registers read 0x80000 until
+// the first conversion completes, and that compensates to a
+// plausible-looking pressure.
+pub const I2C_STATUS_RESET_VALUE = 7
+
+// A measurement is at the top of what the part can report.  The BH1750
+// answers 0xffff for every light level above its ceiling, and the
+// INA219 sets an overflow bit and leaves meaningless numbers in its
+// current and power registers.
+pub const I2C_STATUS_SATURATED = 8
+
+// How many status codes there are: 9.
+pub const I2C_STATUSES = 9
+
+// Whether a code means no fault.
+//
+// ```novo
+// use i2cstatus
+//
+// fn main() [io]
+//     println("${i2cstatus.is_ok(i2cstatus.I2C_STATUS_OK)}")   // true
+// ```
+pub @tier(embedded)
+fn is_ok(status: Int) -> Bool []
+    todo("i2c-devices-nv.i2cstatus.is_ok")
+
+// Whether repeating the same transaction could succeed.
+//
+// True for a data NAK, a CRC mismatch and a read that was too early;
+// false for an address that did not answer, a part that is not the one
+// expected, a missing calibration and a saturated reading.  The
+// question a retry loop has to ask before it becomes an infinite loop
+// against a sensor that is not connected.
+//
+// ```novo
+// use i2cstatus
+//
+// fn main() [io]
+//     println("${i2cstatus.is_transient(i2cstatus.I2C_STATUS_ADDRESS_NAK)}")  // false
+//     println("${i2cstatus.is_transient(i2cstatus.I2C_STATUS_CRC)}")          // true
+// ```
+pub @tier(embedded)
+fn is_transient(status: Int) -> Bool []
+    todo("i2c-devices-nv.i2cstatus.is_transient")
+
+// Whether the code names something a person has to fix with their
+// hands.
+//
+// An address that does not answer and a part that is not the expected
+// one are both diagnosed at the board, not in the program, and a
+// diagnostic that says so saves the reader from reading their own code
+// first.
+pub @tier(embedded)
+fn is_wiring(status: Int) -> Bool []
+    todo("i2c-devices-nv.i2cstatus.is_wiring")
+
+// How long a caller must still wait before retrying, in microseconds.
+//
+// Zero for every code but `I2C_STATUS_NOT_READY`, which answers the
+// rest of the part's conversion time.  A retry loop that waits this
+// long costs one more transaction; one that retries immediately costs
+// as many as the conversion is long.
+pub @tier(embedded)
+fn retry_after_micros(status: Int, conversion_micros: Int, waited_micros: Int) -> Int []
+    todo("i2c-devices-nv.i2cstatus.retry_after_micros")
+
+// The code in words, for a device's log line.
+//
+// A `Str` literal allocates nothing, which is why this is the one
+// naming function a firmware build can call.
+//
+// ```novo
+// use i2cstatus
+//
+// fn main() [io]
+//     println(i2cstatus.status_name(i2cstatus.I2C_STATUS_ADDRESS_NAK))
+// ```
+pub @tier(embedded)
+fn status_name(status: Int) -> Str []
+    todo("i2c-devices-nv.i2cstatus.status_name")

@@ -1,0 +1,251 @@
+// bh1750.nv — ROHM's BH1750FVI ambient light sensor.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// References are to the BH1750FVI datasheet, revision D.
+//
+// THE PART SATURATES AND DOES NOT SAY SO.  Its measurement register is
+// sixteen bits, and at the default settings that ceiling is about
+// 54 612 lux — bright shade on a clear day, and well below direct
+// sunlight at 100 000 lux.  A saturated part answers 0xffff, which is a
+// number, and every reading after that is the same number however much
+// brighter it gets.  So `is_saturated` is published, `reading_of` marks
+// a saturated reading invalid rather than reporting 54 612 lux, and
+// `measurement_time` is the knob that moves the ceiling.
+//
+// THE MEASUREMENT TIME REGISTER SCALES THE READING AS WELL AS THE
+// INTEGRATION, and that is the second thing to get right.  Raising it
+// makes the part integrate for longer AND report proportionally more
+// counts for the same light, so a driver that changes it without
+// dividing the result by the same ratio reports a room that suddenly
+// got four times brighter.  Lowering it is how the ceiling is raised to
+// roughly 121 000 lux; raising it is how the floor is lowered to about
+// 0.11 lux.
+
+// ── Addresses ────────────────────────────────────────────────────────
+
+// The address with the ADDR pin low: 0x23.
+pub const BH1750_ADDR_LOW = 0x23
+// The address with the ADDR pin high: 0x5c.
+pub const BH1750_ADDR_HIGH = 0x5c
+
+// ── The opcodes ──────────────────────────────────────────────────────
+//
+// One byte each, written with no register pointer.  There is no
+// register map and nothing to read back but the measurement.
+
+// Power down: 0x00.  The part draws under 1 µA and forgets nothing.
+pub const BH1750_CMD_POWER_DOWN = 0x00
+// Power on: 0x01.  Required before any other command is accepted.
+pub const BH1750_CMD_POWER_ON = 0x01
+// Reset the measurement register: 0x07.  Accepted only while powered
+// on, and silently ignored otherwise — which is why `reset` powers on
+// first rather than trusting the caller to have done it.
+pub const BH1750_CMD_RESET = 0x07
+
+// ── Modes ────────────────────────────────────────────────────────────
+
+// High resolution: 1 lux per count, about 120 ms.  The mode to use.
+pub const BH1750_MODE_HIGH = 0
+// High resolution 2: 0.5 lux per count, about 120 ms, and half the
+// ceiling.  For a dim room, not for daylight.
+pub const BH1750_MODE_HIGH2 = 1
+// Low resolution: 4 lux per count, about 16 ms.  For a node that only
+// wants to know whether a light is on.
+pub const BH1750_MODE_LOW = 2
+
+// The opcode that starts one measurement in this mode and then powers
+// the part down by itself: 0x20, 0x21 and 0x23.
+//
+// THE ONE-SHOT OPCODES, NOT THE CONTINUOUS ONES, because a part that
+// powers itself down after each reading is a part a battery-powered
+// node does not have to remember to stop.  The continuous opcodes are
+// 0x10, 0x11 and 0x13 and this package does not use them.
+//
+// ```novo
+// use bh1750
+//
+// fn main() [io]
+//     println("${bh1750.oneshot_command(bh1750.BH1750_MODE_HIGH)}")   // 32, 0x20
+// ```
+pub @tier(embedded)
+fn oneshot_command(mode: Int) -> Int []
+    todo("i2c-devices-nv.bh1750.oneshot_command")
+
+// How long a measurement in this mode takes at the default measurement
+// time.
+//
+// The datasheet's maxima: 180 ms for both high-resolution modes and
+// 24 ms for the low one.  The typical figures are 120 ms and 16 ms, and
+// waiting the typical one reads the previous measurement on a part at
+// the edge of its specification.
+pub @tier(embedded)
+fn conversion_time(mode: Int) -> I2cConversion []
+    todo("i2c-devices-nv.bh1750.conversion_time")
+
+// How long a measurement takes at a given measurement time register.
+//
+// The integration scales linearly with the register, so the wait does
+// too: `conversion_time(mode) × mt / BH1750_MT_DEFAULT`.
+pub @tier(embedded)
+fn conversion_time_at(mode: Int, mt: Int) -> I2cConversion []
+    todo("i2c-devices-nv.bh1750.conversion_time_at")
+
+// ── The measurement time register ────────────────────────────────────
+
+// The register's power-on value: 69.
+pub const BH1750_MT_DEFAULT = 69
+// The lowest value the part accepts: 31.  Raises the ceiling to about
+// 121 000 lux, which covers direct sunlight.
+pub const BH1750_MT_MIN = 31
+// The highest value the part accepts: 254.  Lowers the floor to about
+// 0.11 lux in high-resolution mode 2.
+pub const BH1750_MT_MAX = 254
+
+// The first of the two bytes that set the measurement time register.
+//
+// 0x40 with the register's top three bits in the bottom of the byte.
+// The two bytes are two separate one-byte writes, not one two-byte
+// write, and a driver that sends them as a pair sets nothing.
+pub @tier(embedded)
+fn mt_high_byte(mt: Int) -> Int []
+    todo("i2c-devices-nv.bh1750.mt_high_byte")
+
+// The second of the two bytes.
+//
+// 0x60 with the register's bottom five bits in the bottom of the byte.
+pub @tier(embedded)
+fn mt_low_byte(mt: Int) -> Int []
+    todo("i2c-devices-nv.bh1750.mt_low_byte")
+
+// Whether a measurement time register value is one the part accepts.
+pub @tier(embedded)
+fn mt_is_valid(mt: Int) -> Bool []
+    todo("i2c-devices-nv.bh1750.mt_is_valid")
+
+// The brightest reading this mode and measurement time can report, in
+// thousandths of a lux.
+//
+// The number a caller checks its environment against before it trusts
+// the sensor outdoors, and the reason `BH1750_MT_MIN` exists.
+//
+// ```novo
+// use bh1750
+//
+// fn main() [io]
+//     println("${bh1750.ceiling_milli_lux(bh1750.BH1750_MODE_HIGH,
+//                                         bh1750.BH1750_MT_DEFAULT)}")
+// ```
+pub @tier(embedded)
+fn ceiling_milli_lux(mode: Int, mt: Int) -> Int []
+    todo("i2c-devices-nv.bh1750.ceiling_milli_lux")
+
+// ── A reading ────────────────────────────────────────────────────────
+
+// The raw count a saturated part answers: 65535.
+pub const BH1750_RAW_SATURATED = 65535
+
+// Whether the count is the part's ceiling.
+//
+// A reading at the ceiling is not a measurement of 54 612 lux: it is
+// the part saying it cannot see the difference between this and
+// anything brighter.
+pub @tier(embedded)
+fn is_saturated(raw: Int) -> Bool []
+    todo("i2c-devices-nv.bh1750.is_saturated")
+
+// A measured illuminance.
+pub @value
+struct I2cBhReading
+    // Illuminance in thousandths of a lux.
+    milli_lux: Int
+    // Whether this is a measurement.  False for a failed transfer and
+    // false at the ceiling.
+    valid: Bool
+    // Whether the part was at its ceiling.  Distinct from `valid`
+    // being false for a transfer that did not happen, because the
+    // repair is different: this one is answered by lowering the
+    // measurement time register.
+    saturated: Bool
+
+// The illuminance a raw count means, in thousandths of a lux.
+//
+// The count divided by 1.2, halved again in high-resolution mode 2, and
+// scaled by the ratio of the default measurement time to the one in
+// use.
+//
+// THE 1.2 IS A SENSOR CHARACTERISTIC, NOT A UNIT CONVERSION.  The
+// datasheet gives it as a typical value with a range of 0.96 to 1.44,
+// so two BH1750s in the same light legitimately differ by twenty
+// percent.  A program that needs an absolute illuminance calibrates
+// against a reference; this package reports the nominal figure and says
+// so rather than implying a precision the part does not have.
+pub @tier(embedded)
+fn milli_lux_of(raw: Int, mode: Int, mt: Int) -> Int []
+    todo("i2c-devices-nv.bh1750.milli_lux_of")
+
+// A reading from a two-byte transfer.
+pub @tier(embedded)
+fn reading_of(w: I2cWord, mode: Int, mt: Int) -> I2cBhReading []
+    todo("i2c-devices-nv.bh1750.reading_of")
+
+// The illuminance as a sample.
+pub @tier(embedded)
+fn illuminance(r: I2cBhReading) -> I2cSample []
+    todo("i2c-devices-nv.bh1750.illuminance")
+
+// The `i2cstatus` code this reading carries.
+//
+// `I2C_STATUS_SATURATED` at the ceiling, `I2C_STATUS_ADDRESS_NAK` for a
+// transfer that did not happen, and `I2C_STATUS_OK` otherwise.  The two
+// refusals are different repairs: one is answered by lowering the
+// measurement time register and the other by a soldering iron.
+pub @tier(embedded)
+fn reading_status(r: I2cBhReading) -> Int []
+    todo("i2c-devices-nv.bh1750.reading_status")
+
+// ── Over a bus ───────────────────────────────────────────────────────
+
+// Send one opcode.
+pub fn command<B: I2cDeviceBus[e]>(b: B, addr: Int, opcode: Int) -> Bool [e]
+    todo("i2c-devices-nv.bh1750.command")
+
+// Power the part on and clear its measurement register.
+//
+// Powers on first, because the reset opcode is ignored while the part
+// is powered down and the failure is silent.
+pub fn reset<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
+    todo("i2c-devices-nv.bh1750.reset")
+
+// Set the measurement time register.
+//
+// Two one-byte writes, and the part must be powered on for either to
+// take.  Refuses a value outside 31 to 254 rather than sending it.
+pub fn set_measurement_time<B: I2cDeviceBus[e]>(b: B, addr: Int, mt: Int) -> Bool [e]
+    todo("i2c-devices-nv.bh1750.set_measurement_time")
+
+// Trigger one measurement and answer how long it takes.
+//
+// The part powers itself down when the measurement finishes, so a
+// caller that wants another one calls this again.
+pub fn start_measurement<B: I2cDeviceBus[e]>(b: B, addr: Int, mode: Int,
+                                             mt: Int) -> I2cConversion [e]
+    todo("i2c-devices-nv.bh1750.start_measurement")
+
+// Read the two-byte result, refusing a read that is too early.
+//
+// A BH1750 read early answers a PARTIAL INTEGRATION — a light level
+// that is too low in proportion to how early the read was, and is
+// otherwise a perfectly ordinary number.  That is why the wait is
+// checked here rather than trusted.
+pub fn read_reading<B: I2cDeviceBus[e]>(b: B, addr: Int, mode: Int, mt: Int, c: I2cConversion,
+                                        waited_micros: Int) -> I2cBhReading [e]
+    todo("i2c-devices-nv.bh1750.read_reading")
+
+// Power the part down.
+//
+// Worth calling even after a one-shot measurement: a part that was
+// powered on and never asked for a measurement stays on, at about
+// 120 µA, which on a coin cell is the whole power budget.
+pub fn power_down<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
+    todo("i2c-devices-nv.bh1750.power_down")

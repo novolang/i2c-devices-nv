@@ -1,0 +1,64 @@
+[package]
+name        = "i2c-devices-nv"
+version     = "0.0.1"
+description = "Drivers for the I2C parts a battery-powered sensor node carries: the BME280 environment sensor with the datasheet's compensation arithmetic, the SHT3x humidity sensor with the CRC every reply carries, the BH1750 light sensor and the INA219 current monitor.  One bus trait, a conversion time answered rather than slept through, and every register named with its datasheet section.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, WITH NO HOST MODULE, and the plan's row for this package says
+# `host`.  The narrow layer is what the surface measures to.
+#
+# Two thirds of the package is arithmetic over words a caller already
+# holds: the BME280's twenty compensation coefficients and the two
+# polynomials they feed, the SHT3x's CRC, the INA219's calibration
+# divisor, and the register constants themselves.  None of that touches
+# a bus.
+#
+# The third that does is written over `I2cDeviceBus[e]` and declares
+# `[e]` — the effect the implementation behind the bus supplies, which
+# is `[hw]` for a peripheral on a microcontroller and `[]` for a table
+# of recorded bytes in a test (SPEC § 5.6).  A bound effect parameter
+# is inside a layer's budget, because the cost is the implementation's
+# and the implementation is declared where the host is.
+#
+# So nothing in this package performs anything, and the device claim in
+# `tests/embedded_probe.nv` is a thing the audit BUILDS rather than a
+# sentence in a README.  A driver package that could not be linked into
+# firmware would be a driver package for nothing.
+layer       = "core"
+
+category    = "embedded"
+
+tags        = ["i2c", "sensor", "driver", "bme280", "sht3x", "bh1750", "ina219",
+               "embedded", "embedded-hal", "no-alloc"]
+repository  = "https://github.com/novolang/i2c-devices-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A conversion time is a number the caller waits, not a sleep the driver hides"
+
+[dependencies]
+# NONE, and two absences are decisions.
+#
+# NOT crc-nv.  The SHT3x checks every two bytes with CRC-8, polynomial
+# 0x31, initial value 0xff, no reflection and no final xor.  crc-nv
+# publishes four algorithms — CRC-16/CCITT-FALSE, CRC-16/MODBUS, CRC-32
+# and CRC-32C — and none of them is eight bits wide; its `Crc` value
+# also owns a 256-entry table as a `[Int]`, which is a heap allocation
+# and a quarter-kilobyte for a check over three bytes.  `sht3x.crc8`
+# computes the same number bit by bit in twenty-four iterations.  The
+# row crc-nv should open is named in the README.
+#
+# NOT heapless-nv.  Nothing here is a collection: a reading is a
+# `@value` struct of integers and a register write is two bytes on the
+# caller's stack.

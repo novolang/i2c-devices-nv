@@ -1,0 +1,235 @@
+// light_and_power_tests.nv — the two parts whose failure mode is a
+// number: a light sensor that saturates and a current monitor that
+// reads zero until it is calibrated.
+//
+// RED ON PURPOSE: the first `todo()` each test reaches ends it.
+
+use std.test
+use bh1750
+use i2cbus
+use i2csample
+use i2cstatus
+use i2ctiming
+use ina219
+
+// ── BH1750 ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_saturated_light_sensor_is_not_a_bright_measurement() [io]
+    // At the default settings the ceiling is about 54 612 lux — bright
+    // shade, and well below direct sunlight.  A saturated part answers
+    // 0xffff for ever after.
+    test.case("the ceiling count is recognised")
+    test.assert(bh1750.is_saturated(bh1750.BH1750_RAW_SATURATED))
+    test.assert(not bh1750.is_saturated(0x1000))
+
+    test.case("and a saturated reading is not valid")
+    let sat = bh1750.reading_of(i2cbus.word(0xffff, 2),
+                                bh1750.BH1750_MODE_HIGH,
+                                bh1750.BH1750_MT_DEFAULT)
+    test.assert(sat.saturated)
+    test.assert(not sat.valid)
+    test.assert(not bh1750.illuminance(sat).valid)
+    test.assert_eq(bh1750.reading_status(sat), i2cstatus.I2C_STATUS_SATURATED)
+
+    test.case("which is a different repair from a failed transfer")
+    let dead = bh1750.reading_of(i2cbus.word_failed(),
+                                 bh1750.BH1750_MODE_HIGH,
+                                 bh1750.BH1750_MT_DEFAULT)
+    test.assert(not dead.valid)
+    test.assert(not dead.saturated)
+    test.assert_eq(bh1750.reading_status(dead), i2cstatus.I2C_STATUS_ADDRESS_NAK)
+
+@test
+fn test_the_measurement_time_scales_the_reading_as_well_as_the_wait() [io]
+    // A driver that changes the register without dividing the result by
+    // the same ratio reports a room that suddenly got four times
+    // brighter.
+    let raw = 1200
+
+    test.case("the same count means less light at a longer integration")
+    let a = bh1750.milli_lux_of(raw, bh1750.BH1750_MODE_HIGH,
+                                bh1750.BH1750_MT_DEFAULT)
+    let b = bh1750.milli_lux_of(raw, bh1750.BH1750_MODE_HIGH,
+                                bh1750.BH1750_MT_MAX)
+    test.assert(b < a)
+
+    test.case("and the wait grows with it")
+    test.assert(i2ctiming.conversion_micros(
+                    bh1750.conversion_time_at(bh1750.BH1750_MODE_HIGH,
+                                              bh1750.BH1750_MT_MAX))
+                > i2ctiming.conversion_micros(
+                    bh1750.conversion_time(bh1750.BH1750_MODE_HIGH)))
+
+    test.case("lowering the register raises the ceiling")
+    test.assert(bh1750.ceiling_milli_lux(bh1750.BH1750_MODE_HIGH,
+                                         bh1750.BH1750_MT_MIN)
+                > bh1750.ceiling_milli_lux(bh1750.BH1750_MODE_HIGH,
+                                           bh1750.BH1750_MT_DEFAULT))
+
+@test
+fn test_the_measurement_time_is_two_writes_and_a_bounded_range() [io]
+    test.case("the part accepts 31 to 254 and nothing else")
+    test.assert(bh1750.mt_is_valid(bh1750.BH1750_MT_DEFAULT))
+    test.assert(not bh1750.mt_is_valid(30))
+    test.assert(not bh1750.mt_is_valid(255))
+
+    test.case("the high byte carries the top three bits under 0x40")
+    test.assert_eq(bh1750.mt_high_byte(bh1750.BH1750_MT_DEFAULT) & 0xe0, 0x40)
+
+    test.case("and the low byte the bottom five under 0x60")
+    test.assert_eq(bh1750.mt_low_byte(bh1750.BH1750_MT_DEFAULT) & 0xe0, 0x60)
+
+@test
+fn test_the_one_shot_opcodes_power_the_part_down_by_themselves() [io]
+    test.case("0x20, 0x21 and 0x23")
+    test.assert_eq(bh1750.oneshot_command(bh1750.BH1750_MODE_HIGH), 0x20)
+    test.assert_eq(bh1750.oneshot_command(bh1750.BH1750_MODE_HIGH2), 0x21)
+    test.assert_eq(bh1750.oneshot_command(bh1750.BH1750_MODE_LOW), 0x23)
+
+    test.case("the low-resolution mode is ten times quicker")
+    test.assert(i2ctiming.conversion_micros(
+                    bh1750.conversion_time(bh1750.BH1750_MODE_LOW)) * 5
+                < i2ctiming.conversion_micros(
+                    bh1750.conversion_time(bh1750.BH1750_MODE_HIGH)))
+
+    test.case("and the three opcodes a driver sends by hand are named")
+    test.assert_eq(bh1750.BH1750_CMD_POWER_ON, 0x01)
+    test.assert_eq(bh1750.BH1750_CMD_POWER_DOWN, 0x00)
+    test.assert_eq(bh1750.BH1750_CMD_RESET, 0x07)
+    test.assert_eq(bh1750.BH1750_ADDR_HIGH, 0x5c)
+
+// ── INA219 ───────────────────────────────────────────────────────────
+
+@test
+fn test_an_uncalibrated_current_monitor_refuses_instead_of_answering_zero() [io]
+    // The current and power registers read exactly 0.000 A until
+    // register 0x05 is written, which reads as "nothing is drawing
+    // current" and is indistinguishable from a correct measurement of
+    // an idle load.
+    let none = ina219.no_calibration()
+    test.assert(not none.ok)
+
+    let r = ina219.reading_of(0, 0x0678, 0, 0, none)
+
+    test.case("the current and the power are not measurements")
+    test.assert(not r.calibrated)
+    test.assert(not ina219.current(r).valid)
+    test.assert(not ina219.power(r).valid)
+
+    test.case("but the two voltages are, because they need no calibration")
+    test.assert(ina219.voltage(r).valid)
+    test.assert_eq(ina219.voltage(r).quantity, i2csample.I2C_Q_VOLTAGE)
+
+    test.case("and the reading names why the rest is missing")
+    test.assert_eq(ina219.reading_status(r), i2cstatus.I2C_STATUS_UNCALIBRATED)
+
+@test
+fn test_the_bus_voltage_is_in_the_top_thirteen_bits() [io]
+    // A driver that scales the whole word reports eight times the
+    // voltage, which on a 3.3 V rail is 26 V and looks like a wiring
+    // fault.
+    test.case("0x0678 is about 3.308 volts")
+    test.assert_eq(ina219.bus_uv_of(0x0678), 3308000)
+
+    test.case("the two flags live in the bottom bits")
+    test.assert(ina219.bus_conversion_ready(0x0678 | ina219.INA219_BUS_CNVR))
+    test.assert(ina219.bus_overflow(0x0678 | ina219.INA219_BUS_OVF))
+    test.assert(not ina219.bus_overflow(0x0678))
+
+    test.case("and the shunt voltage is signed at 10 microvolts a count")
+    test.assert_eq(ina219.shunt_uv_of(1000), 10000)
+    test.assert_eq(ina219.shunt_uv_of(-1000), -10000)
+    test.assert_eq(ina219.INA219_SHUNT_LSB_TENTH_UV, 100)
+    test.assert_eq(ina219.INA219_BUS_LSB_UV, 4000)
+
+@test
+fn test_a_calibration_that_the_gain_cannot_see_is_refused() [io]
+    // The shunt voltage is the current times the resistance, the gain
+    // sets a ceiling on it, and a 0.1 ohm shunt at plus or minus 320 mV
+    // saturates at 3.2 A.
+    test.case("3.2 A through 0.1 ohm fits the widest gain and no other")
+    test.assert(ina219.gain_fits(ina219.INA219_PGA_320MV, 100, 3200000))
+    test.assert(not ina219.gain_fits(ina219.INA219_PGA_40MV, 100, 3200000))
+
+    test.case("and the smallest gain that fits is answered")
+    test.assert_eq(ina219.gain_for(100, 400000), ina219.INA219_PGA_40MV)
+
+    test.case("the full scales are the datasheet's four")
+    test.assert_eq(ina219.gain_full_scale_uv(ina219.INA219_PGA_40MV), 40000)
+    test.assert_eq(ina219.gain_full_scale_uv(ina219.INA219_PGA_320MV), 320000)
+
+@test
+fn test_a_calibration_carries_what_it_assumed() [io]
+    let cal = ina219.calibration(100, 3200000)
+
+    test.case("the shunt it was computed for is kept")
+    test.assert(cal.ok)
+    test.assert_eq(cal.shunt_milliohm, 100)
+
+    test.case("the power LSB is twenty times the current LSB, fixed by the part")
+    test.assert_eq(cal.power_lsb_uw * 1000, cal.current_lsb_na * 20)
+
+    test.case("and the register value is the datasheet's formula")
+    test.assert(cal.reg > 0)
+    test.assert_eq(ina219.INA219_CAL_NUMERATOR, 40960000)
+
+    test.case("a count times the LSB is the current")
+    test.assert_eq(ina219.current_ua_of(0, cal), 0)
+    test.assert(ina219.power_uw_of(100, cal) > 0)
+
+@test
+fn test_the_configuration_round_trips_through_its_register_word() [io]
+    // Worth doing once at startup, because a part strapped to an
+    // address another part also answers accepts the write and ignores
+    // it.
+    let c = ina219.config(ina219.INA219_BRNG_16V, ina219.INA219_PGA_80MV,
+                          ina219.INA219_ADC_12BIT, ina219.INA219_ADC_128SAMPLE,
+                          ina219.INA219_MODE_BOTH_TRIGGERED)
+
+    test.case("what goes in comes out")
+    let back = ina219.config_from_word(ina219.config_word(c))
+    test.assert_eq(back.gain, ina219.INA219_PGA_80MV)
+    test.assert_eq(back.mode, ina219.INA219_MODE_BOTH_TRIGGERED)
+    test.assert_eq(back.shunt_adc, ina219.INA219_ADC_128SAMPLE)
+
+    test.case("the part powers up in 32 V, divide by eight, both continuous")
+    let d = ina219.default_config()
+    test.assert_eq(d.bus_range, ina219.INA219_BRNG_32V)
+    test.assert_eq(d.gain, ina219.INA219_PGA_320MV)
+    test.assert_eq(d.mode, ina219.INA219_MODE_BOTH_CONTINUOUS)
+
+@test
+fn test_the_conversion_time_spans_three_orders_of_magnitude() [io]
+    // A fixed delay in a driver is wrong at one end or the other.
+    test.case("twelve bits on both channels is about a millisecond")
+    let quick = ina219.conversion_time(
+        ina219.config(ina219.INA219_BRNG_16V, ina219.INA219_PGA_320MV,
+                      ina219.INA219_ADC_12BIT, ina219.INA219_ADC_12BIT,
+                      ina219.INA219_MODE_BOTH_TRIGGERED))
+
+    test.case("and a hundred and twenty-eight samples is over a hundred")
+    let slow = ina219.conversion_time(
+        ina219.config(ina219.INA219_BRNG_16V, ina219.INA219_PGA_320MV,
+                      ina219.INA219_ADC_128SAMPLE, ina219.INA219_ADC_128SAMPLE,
+                      ina219.INA219_MODE_BOTH_TRIGGERED))
+    test.assert(slow.micros > quick.micros * 100)
+
+    test.case("the registers and the address range are named")
+    test.assert_eq(ina219.INA219_REG_CALIBRATION, 0x05)
+    test.assert_eq(ina219.INA219_REG_CONFIG, 0x00)
+    test.assert_eq(ina219.INA219_REG_SHUNT, 0x01)
+    test.assert_eq(ina219.INA219_REG_BUS, 0x02)
+    test.assert_eq(ina219.INA219_REG_POWER, 0x03)
+    test.assert_eq(ina219.INA219_REG_CURRENT, 0x04)
+    test.assert_eq(ina219.INA219_ADDR_MAX - ina219.INA219_ADDR_MIN, 15)
+
+@test
+fn test_power_can_be_had_without_the_calibration_register() [io]
+    // The only power figure available on a part whose calibration
+    // register has not been written, which is the state every INA219
+    // powers up in.
+    let r = ina219.reading_of(1000, 0x0678, 0, 0, ina219.no_calibration())
+
+    test.case("the bus voltage times the current through the shunt")
+    test.assert(ina219.implied_power_uw(r, 100) > 0)

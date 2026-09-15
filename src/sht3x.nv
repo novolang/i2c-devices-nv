@@ -1,0 +1,355 @@
+// sht3x.nv — Sensirion's SHT3x-DIS humidity and temperature sensor,
+// and the checksum every one of its replies carries.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// References are to the SHT3x-DIS datasheet, version 6.
+//
+// THIS PART HAS NO REGISTER MAP.  Everything is a sixteen-bit command
+// written straight after the address byte, and a read that follows
+// takes whatever the last command queued up (§ 4.3).  So the bus
+// primitives this module uses are `i2c_write_raw` and `i2c_read_raw`
+// rather than the register pair the Bosch parts use, and a caller that
+// tried to talk to it through a register read gets a command it did not
+// mean to send.
+//
+// EVERY TWO BYTES CARRY THEIR OWN CRC, AND BOTH MUST BE CHECKED.  A
+// measurement reply is six bytes: temperature high, temperature low, a
+// CRC over those two, then humidity high, humidity low, and a CRC over
+// those two (§ 4.3).  The checksum is per WORD, not per reply.  A
+// driver that checks only the first has an unchecked humidity; one that
+// runs the algorithm over all four data bytes at once gets a number
+// that matches neither CRC and rejects every good reading.
+//
+// CLOCK STRETCHING IS NOT USED HERE, AND THAT IS A DECISION.  The part
+// offers a mode in which it holds the clock line low until the
+// measurement is finished, so a read issued immediately blocks until
+// the answer is ready (§ 4.3).  It is convenient and this package does
+// not use it: fifteen milliseconds of a held clock line is fifteen
+// milliseconds no other part on the bus can be reached, many
+// microcontroller I2C peripherals abort a transfer that is stretched
+// that long, and a node that sleeps through its conversion cannot sleep
+// through a transaction it is in the middle of.  The commands here are
+// the non-stretching ones, and the wait is the caller's.
+
+// ── Addresses ────────────────────────────────────────────────────────
+
+// The address with the ADDR pin tied to ground: 0x44 (§ 4.5, table 7).
+pub const SHT3X_ADDR_LOW = 0x44
+// The address with the ADDR pin tied to the supply: 0x45.
+pub const SHT3X_ADDR_HIGH = 0x45
+
+// ── The checksum (§ 4.4) ─────────────────────────────────────────────
+
+// The CRC polynomial: 0x31, which is x⁸ + x⁵ + x⁴ + 1.
+pub const SHT3X_CRC_POLYNOMIAL = 0x31
+// The CRC's initial value: 0xff.
+pub const SHT3X_CRC_INIT = 0xff
+
+// The CRC-8 of two bytes, the way this part computes it.
+//
+// Polynomial 0x31, initial value 0xff, no input or output reflection
+// and no final exclusive-or.  The datasheet's own worked example is
+// 0xbeef, whose checksum is 0x92, and that is the number to check an
+// implementation against — a CRC-8 that disagrees with another
+// implementation is almost always a different variant rather than a
+// wrong one.
+//
+// BIT BY BIT, WITH NO TABLE.  Twenty-four iterations for a whole reply,
+// against a 256-entry table that costs a quarter of a kilobyte of
+// flash and an allocation to build.  On a part with sixty-four
+// kilobytes of RAM the loop is the cheaper of the two.
+//
+// ```novo
+// use sht3x
+//
+// fn main() [io]
+//     println("${sht3x.crc8(0xbe, 0xef)}")   // 146, which is 0x92
+// ```
+pub @tier(embedded)
+fn crc8(hi: Int, lo: Int) -> Int []
+    todo("i2c-devices-nv.sht3x.crc8")
+
+// Whether a two-byte word and its checksum agree.
+pub @tier(embedded)
+fn crc_ok(hi: Int, lo: Int, crc: Int) -> Bool []
+    todo("i2c-devices-nv.sht3x.crc_ok")
+
+// ── Repeatability (§ 2.2, table 4) ───────────────────────────────────
+//
+// The part trades measurement time and current against noise.  The
+// three settings are the datasheet's, and the numbers are why a
+// battery-powered node picks the low one: the difference between high
+// and low is eleven milliseconds awake per reading and a repeatability
+// of 0.15 %RH against 0.25 %RH, which is well inside the sensor's own
+// accuracy either way.
+
+// High repeatability: 15.5 ms worst case, 0.04 °C and 0.08 %RH noise.
+pub const SHT3X_REPEATABILITY_HIGH = 0
+// Medium repeatability: 6.5 ms, 0.08 °C and 0.15 %RH.
+pub const SHT3X_REPEATABILITY_MEDIUM = 1
+// Low repeatability: 4.5 ms, 0.15 °C and 0.21 %RH.
+pub const SHT3X_REPEATABILITY_LOW = 2
+
+// The single-shot command for this repeatability, clock stretching
+// disabled (§ 4.3, table 8).
+//
+// 0x2400, 0x240b and 0x2416 for high, medium and low.
+//
+// ```novo
+// use sht3x
+//
+// fn main() [io]
+//     println("${sht3x.measure_command(sht3x.SHT3X_REPEATABILITY_HIGH)}")
+//     // 9216, which is 0x2400
+// ```
+pub @tier(embedded)
+fn measure_command(repeatability: Int) -> Int []
+    todo("i2c-devices-nv.sht3x.measure_command")
+
+// How long a measurement at this repeatability takes.
+//
+// The datasheet's worst case, not its typical: 15.5, 6.5 and 4.5
+// milliseconds.  A driver that waited the typical value reads early on
+// a part at the edge of its specification, and the failure is a NAK
+// that looks like a bus fault.
+pub @tier(embedded)
+fn conversion_time(repeatability: Int) -> I2cConversion []
+    todo("i2c-devices-nv.sht3x.conversion_time")
+
+// ── The other commands (§ 4.9 to § 4.11) ─────────────────────────────
+
+// Soft reset: 0x30a2.  Returns the part to its power-on state.
+pub const SHT3X_CMD_SOFT_RESET = 0x30a2
+// Stop a periodic measurement: 0x3093.  The command a driver must send
+// before any single-shot command, because a part in periodic mode
+// ignores single-shot commands entirely.
+pub const SHT3X_CMD_BREAK = 0x3093
+// Turn the on-chip heater on: 0x306d.
+pub const SHT3X_CMD_HEATER_ON = 0x306d
+// Turn the on-chip heater off: 0x3066.
+pub const SHT3X_CMD_HEATER_OFF = 0x3066
+// Read the status register: 0xf32d.
+pub const SHT3X_CMD_READ_STATUS = 0xf32d
+// Clear the status register: 0x3041.
+pub const SHT3X_CMD_CLEAR_STATUS = 0x3041
+
+// ── The status register (§ 4.11, table 18) ───────────────────────────
+
+// Bit 15: an alert is pending.
+pub const SHT3X_STATUS_ALERT = 0x8000
+// Bit 13: the heater is on.
+pub const SHT3X_STATUS_HEATER = 0x2000
+// Bit 11: a humidity tracking alert.
+pub const SHT3X_STATUS_RH_ALERT = 0x0800
+// Bit 10: a temperature tracking alert.
+pub const SHT3X_STATUS_T_ALERT = 0x0400
+// Bit 4: the part has been reset since this bit was last cleared.
+//
+// THE ONE BIT WORTH READING ON EVERY CYCLE.  A part that browned out
+// and restarted has lost its periodic mode, its heater setting and its
+// alert limits, and every measurement after that is taken with the
+// power-on defaults — silently, because a reset part answers reads
+// perfectly well.
+pub const SHT3X_STATUS_RESET_DETECTED = 0x0010
+// Bit 1: the last command was not processed.
+pub const SHT3X_STATUS_COMMAND_FAILED = 0x0002
+// Bit 0: the last write's checksum was wrong.
+pub const SHT3X_STATUS_WRITE_CRC_FAILED = 0x0001
+
+// Whether the status word says the part has restarted.
+//
+// ```novo
+// use sht3x
+//
+// fn main() [io]
+//     println("${sht3x.status_was_reset(0x8010)}")   // true
+// ```
+pub @tier(embedded)
+fn status_was_reset(status: Int) -> Bool []
+    todo("i2c-devices-nv.sht3x.status_was_reset")
+
+// Whether the status word says the heater is on.
+//
+// The heater raises the sensor's own temperature by several degrees, so
+// a temperature read with it on is not an ambient temperature.  It is
+// there to drive condensation off the sensor, and a driver that leaves
+// it on reports a room that is warm and dry.
+pub @tier(embedded)
+fn status_heater_on(status: Int) -> Bool []
+    todo("i2c-devices-nv.sht3x.status_heater_on")
+
+// The status word in words, one line, for a log.
+pub @tier(embedded)
+fn status_name(status: Int) -> Str []
+    todo("i2c-devices-nv.sht3x.status_name")
+
+// ── A reply ──────────────────────────────────────────────────────────
+
+// The six bytes of a measurement reply, checked.
+pub @value
+struct I2cShtReply
+    // The sixteen-bit temperature word, uncompensated.
+    raw_temp: Int
+    // The sixteen-bit humidity word, uncompensated.
+    raw_hum: Int
+    // Whether the temperature word's checksum agreed.
+    temp_crc_ok: Bool
+    // Whether the humidity word's checksum agreed.
+    hum_crc_ok: Bool
+    // Whether six bytes were received at all.
+    ok: Bool
+
+// The reply in a six-byte word.
+//
+// Checks both checksums here rather than leaving it to the caller,
+// because the reply is not usable without them and a driver that made
+// the check optional would have made it omittable.
+pub @tier(embedded)
+fn reply_from(w: I2cWord) -> I2cShtReply []
+    todo("i2c-devices-nv.sht3x.reply_from")
+
+// Whether the whole reply is usable: six bytes and both checksums.
+pub @tier(embedded)
+fn reply_ok(r: I2cShtReply) -> Bool []
+    todo("i2c-devices-nv.sht3x.reply_ok")
+
+// The `i2cstatus` code this reply carries.
+//
+// `I2C_STATUS_CRC` when six bytes arrived and either checksum
+// disagreed, `I2C_STATUS_DATA_NAK` when they did not arrive, and
+// `I2C_STATUS_OK` otherwise.
+pub @tier(embedded)
+fn reply_status(r: I2cShtReply) -> Int []
+    todo("i2c-devices-nv.sht3x.reply_status")
+
+// ── The conversion (§ 4.13) ──────────────────────────────────────────
+
+// The denominator both conversions divide by: 65535, which is 2¹⁶ - 1.
+//
+// NOT 65536, and the difference matters at the ends of the range: a
+// raw word of 0xffff is exactly 100 %RH with the right denominator and
+// 99.998 % with the wrong one, which is a humidity that never quite
+// reaches saturation and a bug nobody finds indoors.
+pub const SHT3X_SCALE = 65535
+
+// A compensated reading.
+pub @value
+struct I2cShtReading
+    // Temperature in thousandths of a degree Celsius.
+    milli_c: Int
+    // Relative humidity in thousandths of a percent.
+    milli_rh: Int
+    // Whether both are measurements.
+    valid: Bool
+
+// The temperature a raw word means, in thousandths of a degree.
+//
+// § 4.13: -45 + 175 × S / (2¹⁶ - 1).  The range is fixed by the
+// formula, so this part reports -45 °C to +130 °C and nothing outside
+// it, whatever the sensor is actually in.
+//
+// ```novo
+// use sht3x
+//
+// fn main() [io]
+//     println("${sht3x.temperature_of(0x6666)}")   // 24999, about 25 C
+// ```
+pub @tier(embedded)
+fn temperature_of(raw: Int) -> Int []
+    todo("i2c-devices-nv.sht3x.temperature_of")
+
+// The relative humidity a raw word means, in thousandths of a percent.
+//
+// § 4.13: 100 × S / (2¹⁶ - 1).  0 to 100 percent by construction, so
+// there is nothing to clamp.
+pub @tier(embedded)
+fn humidity_of(raw: Int) -> Int []
+    todo("i2c-devices-nv.sht3x.humidity_of")
+
+// Both, from a checked reply.
+//
+// A reply whose checksums did not agree answers a reading that is not
+// valid, with both numbers zero.
+pub @tier(embedded)
+fn reading_of(r: I2cShtReply) -> I2cShtReading []
+    todo("i2c-devices-nv.sht3x.reading_of")
+
+// The temperature as a sample.
+pub @tier(embedded)
+fn temperature(r: I2cShtReading) -> I2cSample []
+    todo("i2c-devices-nv.sht3x.temperature")
+
+// The relative humidity as a sample.
+pub @tier(embedded)
+fn humidity(r: I2cShtReading) -> I2cSample []
+    todo("i2c-devices-nv.sht3x.humidity")
+
+// The dew point of a reading, in thousandths of a degree Celsius.
+//
+// The number a condensation alarm actually wants: relative humidity
+// alone says nothing about whether water will form on a surface, and a
+// node that reports 80 %RH at 5 °C and 80 %RH at 25 °C is reporting two
+// very different risks.  The Magnus approximation, which is accurate to
+// about 0.35 °C between -45 °C and +60 °C.
+//
+// Answers zero and is not meaningful outside that range; the caller
+// checks the temperature first.
+pub @tier(embedded)
+fn dew_point(r: I2cShtReading) -> Int []
+    todo("i2c-devices-nv.sht3x.dew_point")
+
+// ── Over a bus ───────────────────────────────────────────────────────
+
+// Send one sixteen-bit command.
+//
+// The primitive every other bus function here is built from: two bytes,
+// most significant first, with no register pointer.
+pub fn command<B: I2cDeviceBus[e]>(b: B, addr: Int, cmd: Int) -> Bool [e]
+    todo("i2c-devices-nv.sht3x.command")
+
+// Stop any periodic measurement and soft-reset the part.
+//
+// BREAK FIRST, THEN RESET, and that order is not decoration: a part in
+// periodic mode ignores every command except break and fetch (§ 4.5),
+// soft reset included.  A driver that opens with a reset against a part
+// left in periodic mode by a previous run changes nothing and then
+// finds its single-shot commands ignored too.
+pub fn reset<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
+    todo("i2c-devices-nv.sht3x.reset")
+
+// Read the status register, or -1.
+//
+// Three bytes: the status word and its checksum.
+pub fn read_status<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Int [e]
+    todo("i2c-devices-nv.sht3x.read_status")
+
+// Clear the status register's alert and reset-detected bits.
+pub fn clear_status<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
+    todo("i2c-devices-nv.sht3x.clear_status")
+
+// Turn the on-chip heater on or off.
+//
+// The heater is for driving condensation off the sensor and for
+// checking that the sensor is alive — a part whose humidity does not
+// fall when the heater runs is a part that is not reading its own
+// element.  It is not a thermostat and the temperature measured while
+// it is on is not the room's.
+pub fn set_heater<B: I2cDeviceBus[e]>(b: B, addr: Int, on: Bool) -> Bool [e]
+    todo("i2c-devices-nv.sht3x.set_heater")
+
+// Trigger one single-shot measurement and answer how long it takes.
+pub fn start_measurement<B: I2cDeviceBus[e]>(b: B, addr: Int,
+                                             repeatability: Int) -> I2cConversion [e]
+    todo("i2c-devices-nv.sht3x.start_measurement")
+
+// Read the six-byte reply, refusing a read that is too early.
+//
+// `waited_micros` is how long the caller waited since
+// `start_measurement`.  A part read too early NAKs, and this answers a
+// reply that is not ok rather than passing a bus fault up: the two are
+// diagnosed differently and only this function knows which one it is
+// looking at.
+pub fn read_reply<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cConversion,
+                                      waited_micros: Int) -> I2cShtReply [e]
+    todo("i2c-devices-nv.sht3x.read_reply")

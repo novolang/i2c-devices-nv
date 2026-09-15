@@ -1,0 +1,227 @@
+// i2cbus_tests.nv — the half of the package that drives a bus, named
+// from outside it with a bus of the caller's own.
+//
+// RED ON PURPOSE: the first `todo()` each test reaches ends it.
+//
+// THE POINT OF THIS FILE IS THE IMPL.  `I2cTestTape` satisfies
+// `I2cDeviceBus[]` — the empty supply, which is how an implementation
+// asserts it is pure (SPEC § 5.6) — so every driver function in this
+// package is called here at NO EFFECT AT ALL.  That is the claim the
+// layer rests on: a `core` package whose bus functions declare `[e]`
+// costs a caller whatever the caller's bus costs, and a caller whose
+// bus is a table of recorded bytes pays nothing.  The same functions
+// against a peripheral driver would be `[hw]`, and nothing in this
+// package changes.
+//
+// It is also the shape a real test suite will take once the bodies
+// land: a recorded exchange with a part, replayed with no hardware.
+
+use std.test
+use bh1750
+use bme280
+use i2cbus
+use i2cstatus
+use i2ctiming
+use ina219
+use sht3x
+
+// A bus that answers the same bytes to everything.
+//
+// Enough to name every signature; a suite with bodies behind it would
+// carry a script of expected transactions instead.
+struct I2cTestTape
+    // The bytes every read answers.
+    canned: Int
+    // Whether the part at every address acknowledges.
+    responds: Bool
+
+impl I2cDeviceBus[] for I2cTestTape
+    fn i2c_write_reg(self, addr: Int, reg: Int, val: Int) -> Bool
+        self.responds
+
+    fn i2c_read_reg(self, addr: Int, reg: Int, n: Int) -> I2cWord
+        if self.responds
+            i2cbus.word(self.canned, n)
+        else
+            i2cbus.word_failed()
+
+    fn i2c_write_raw(self, addr: Int, bytes: Int, len: Int) -> Bool
+        self.responds
+
+    fn i2c_read_raw(self, addr: Int, n: Int) -> I2cWord
+        if self.responds
+            i2cbus.word(self.canned, n)
+        else
+            i2cbus.word_failed()
+
+    fn i2c_present(self, addr: Int) -> Bool
+        self.responds
+
+    fn i2c_frequency(self) -> Int
+        400000
+
+fn a_tape() -> I2cTestTape
+    I2cTestTape { canned: 0x6085000000000000, responds: true }
+
+fn a_dead_bus() -> I2cTestTape
+    I2cTestTape { canned: 0, responds: false }
+
+@test
+fn test_a_pure_bus_costs_a_caller_nothing() [io]
+    // This test declares `[io]` for its own assertions and nothing
+    // else.  Every driver call below is charged the impl's supply,
+    // which is empty.
+    let b = a_tape()
+
+    test.case("the bus answers its configured frequency without performing")
+    test.assert_eq(b.i2c_frequency(), 400000)
+
+    test.case("a register read comes back as a word")
+    test.assert(i2cbus.word_ok(b.i2c_read_reg(0x76, 0xd0, 1)))
+
+    test.case("and a dead bus answers a word that is not ok")
+    test.assert(not i2cbus.word_ok(a_dead_bus().i2c_read_reg(0x76, 0xd0, 1)))
+
+@test
+fn test_the_bus_helpers_are_written_once_over_the_trait() [io]
+    let b = a_tape()
+
+    test.case("a single byte, or -1")
+    test.assert_eq(i2cbus.read_byte(b, 0x76, bme280.BME280_REG_ID), 0x60)
+    test.assert_eq(i2cbus.read_byte(a_dead_bus(), 0x76, bme280.BME280_REG_ID), -1)
+
+    test.case("a checked read names its status")
+    test.assert_eq(i2cbus.read_reg_checked(a_dead_bus(), 0x76, 0xd0, 1),
+                   i2cstatus.I2C_STATUS_ADDRESS_NAK)
+    test.assert_eq(i2cbus.read_reg_checked(b, 0x76, 0xd0, 1),
+                   i2cstatus.I2C_STATUS_OK)
+
+    test.case("read, modify, write, so a register's other fields survive")
+    test.assert(i2cbus.update_reg(b, 0x76, bme280.BME280_REG_CONFIG, 0x1c, 0x10))
+
+    test.case("an identification check before anything is configured")
+    test.assert(i2cbus.chip_is(b, 0x76, bme280.BME280_REG_ID,
+                               bme280.BME280_CHIP_ID))
+
+    test.case("and a scan that says how many transactions it costs")
+    test.assert_eq(i2cbus.scan_next(b, i2cbus.I2C_ADDR_MIN), i2cbus.I2C_ADDR_MIN)
+    test.assert_eq(i2cbus.scan_next(a_dead_bus(), i2cbus.I2C_ADDR_MIN), -1)
+
+    test.case("a word from a dead bus carries a wiring code")
+    test.assert(i2cstatus.is_wiring(i2cbus.word_status(i2cbus.word_failed())))
+    test.assert(i2cstatus.is_ok(i2cbus.word_status(i2cbus.word(0, 1))))
+
+@test
+fn test_the_bosch_part_is_driven_in_the_order_it_insists_on() [io]
+    let b = a_tape()
+
+    test.case("identify before configure, because 0x76 is shared")
+    test.assert_eq(bme280.identify(b, bme280.BME280_ADDR_LOW),
+                   bme280.BME280_CHIP_ID)
+
+    test.case("reset, then wait for the calibration image")
+    test.assert(bme280.reset(b, bme280.BME280_ADDR_LOW))
+    test.assert(bme280.is_calibration_ready(b, bme280.BME280_ADDR_LOW))
+
+    test.case("the calibration is read once, in five transactions")
+    let cal = bme280.read_calibration(b, bme280.BME280_ADDR_LOW)
+    test.assert(bme280.calibration_ok(cal))
+
+    test.case("configure writes ctrl_hum before ctrl_meas")
+    test.assert(bme280.configure(b, bme280.BME280_ADDR_LOW,
+                                 bme280.weather_monitoring()))
+
+    test.case("a forced measurement answers its own wait")
+    let c = bme280.start_measurement(b, bme280.BME280_ADDR_LOW,
+                                     bme280.weather_monitoring())
+    test.assert(c.micros > 0)
+    test.assert(not bme280.is_measuring(b, bme280.BME280_ADDR_LOW))
+
+    test.case("and a read that did not wait is refused")
+    test.assert(not bme280.read_raw(b, bme280.BME280_ADDR_LOW, c, 0).ok)
+
+@test
+fn test_the_sensirion_part_is_broken_out_of_periodic_mode_first() [io]
+    // A part in periodic mode ignores every command except break and
+    // fetch, soft reset included.
+    let b = a_tape()
+
+    test.case("break, then reset")
+    test.assert(sht3x.reset(b, sht3x.SHT3X_ADDR_LOW))
+
+    test.case("a raw command with no register pointer")
+    test.assert(sht3x.command(b, sht3x.SHT3X_ADDR_LOW, sht3x.SHT3X_CMD_BREAK))
+
+    test.case("the status register, and clearing it")
+    test.assert(sht3x.read_status(b, sht3x.SHT3X_ADDR_LOW) >= 0)
+    test.assert(sht3x.clear_status(b, sht3x.SHT3X_ADDR_LOW))
+
+    test.case("the heater is a diagnostic, not a thermostat")
+    test.assert(sht3x.set_heater(b, sht3x.SHT3X_ADDR_LOW, true))
+    test.assert(sht3x.set_heater(b, sht3x.SHT3X_ADDR_LOW, false))
+
+    test.case("and a reply read too early is refused rather than NAKed up")
+    let c = sht3x.start_measurement(b, sht3x.SHT3X_ADDR_LOW,
+                                    sht3x.SHT3X_REPEATABILITY_HIGH)
+    test.assert(not sht3x.reply_ok(
+        sht3x.read_reply(b, sht3x.SHT3X_ADDR_LOW, c, 0)))
+
+@test
+fn test_the_light_sensor_is_powered_on_before_it_is_reset() [io]
+    // The reset opcode is ignored while the part is powered down, and
+    // the failure is silent.
+    let b = a_tape()
+
+    test.case("reset powers on first")
+    test.assert(bh1750.reset(b, bh1750.BH1750_ADDR_LOW))
+
+    test.case("a bare opcode")
+    test.assert(bh1750.command(b, bh1750.BH1750_ADDR_LOW,
+                               bh1750.BH1750_CMD_POWER_ON))
+
+    test.case("the measurement time register, refused outside its range")
+    test.assert(bh1750.set_measurement_time(b, bh1750.BH1750_ADDR_LOW,
+                                            bh1750.BH1750_MT_DEFAULT))
+    test.assert(not bh1750.set_measurement_time(b, bh1750.BH1750_ADDR_LOW, 300))
+
+    test.case("a one-shot measurement, and a read that did not wait")
+    let c = bh1750.start_measurement(b, bh1750.BH1750_ADDR_LOW,
+                                     bh1750.BH1750_MODE_HIGH,
+                                     bh1750.BH1750_MT_DEFAULT)
+    test.assert(i2ctiming.conversion_micros(c) > 0)
+    test.assert(not bh1750.read_reading(b, bh1750.BH1750_ADDR_LOW,
+                                        bh1750.BH1750_MODE_HIGH,
+                                        bh1750.BH1750_MT_DEFAULT, c, 0).valid)
+
+    test.case("and a part left powered on costs the whole power budget")
+    test.assert(bh1750.power_down(b, bh1750.BH1750_ADDR_LOW))
+
+@test
+fn test_the_current_monitor_is_calibrated_or_it_reads_zero() [io]
+    let b = a_tape()
+    let cal = ina219.calibration(100, 3200000)
+
+    test.case("a reset clears the calibration register too")
+    test.assert(ina219.reset(b, ina219.INA219_ADDR_MIN))
+    test.assert(not ina219.is_calibrated(a_dead_bus(), ina219.INA219_ADDR_MIN))
+
+    test.case("configure, then calibrate")
+    test.assert(ina219.configure(b, ina219.INA219_ADDR_MIN,
+                                 ina219.default_config()))
+    test.assert(ina219.write_calibration(b, ina219.INA219_ADDR_MIN, cal))
+
+    test.case("and a calibration that was never computed is not written")
+    test.assert(not ina219.write_calibration(b, ina219.INA219_ADDR_MIN,
+                                             ina219.no_calibration()))
+
+    test.case("a triggered conversion answers its own wait")
+    let c = ina219.start_measurement(b, ina219.INA219_ADDR_MIN,
+                                     ina219.default_config())
+    test.assert(c.micros > 0)
+
+    test.case("four registers, with the power register read last")
+    let r = ina219.read_reading(b, ina219.INA219_ADDR_MIN, cal, c, c.micros)
+    test.assert(r.calibrated)
+
+    test.case("and the two that need no calibration can be had alone")
+    test.assert(ina219.read_voltages(b, ina219.INA219_ADDR_MIN).bus_uv >= 0)

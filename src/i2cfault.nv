@@ -1,0 +1,98 @@
+// i2cfault.nv — a status code with the numbers that explain it,
+// for a program with a log and a heap.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  A fault is a value; nothing here touches a bus.
+//
+// NOT CLAIMED FOR A DEVICE, AND NO MODULE THAT IS USES THIS ONE.  An
+// `I2cFault` variant carries an address, a pair of checksums or a raw
+// word, and a payload-carrying enum variant is a heap value that
+// `@tier(embedded)` refuses (SPEC § 12.4).  A driver in firmware
+// therefore answers an `i2cstatus` code, `i2cstatus` is what the part
+// modules import, and this module is the last step a host program takes
+// before it writes a line somebody reads.  Keeping the two apart is
+// what lets `tests/embedded_probe.nv` link at all: the probe's use
+// graph reaches `i2cstatus` and never reaches this file.
+
+// Why a transaction did not produce a reading, with the numbers that
+// say which transaction and why.
+pub enum I2cFault
+    // Nothing acknowledged the address byte.
+    I2cFaultAddressNak(addr: Int)
+    // The part acknowledged its address and then refused a byte.
+    I2cFaultDataNak(addr: Int)
+    // A reply's check byte disagreed with the bytes it covers.
+    I2cFaultCrc(expected: Int, got: Int)
+    // Something answered at the address and it is not the expected
+    // part.
+    I2cFaultWrongChip(addr: Int, chip_id: Int)
+    // A measurement was read before its conversion time had elapsed.
+    // The field is how long the caller did wait, in microseconds.
+    I2cFaultNotReady(waited_micros: Int)
+    // A compensated value was asked for with no calibration.
+    I2cFaultUncalibrated(addr: Int)
+    // A raw word is the register's reset value rather than a
+    // measurement.
+    I2cFaultResetValue(raw: Int)
+    // The part is at the top of what it can report.
+    I2cFaultSaturated(addr: Int)
+
+// The fault a status code and its two numbers mean, or nothing for
+// `I2C_STATUS_OK`.
+//
+// `a` and `b` are whatever the code needs: the address for most of
+// them, the expected and received checksums for a CRC mismatch, the
+// address and the identification byte for the wrong part, the wait and
+// nothing for a read that was too early, and the raw word and nothing
+// for a reset value.  Two integers rather than a variant per call,
+// because the call site is a driver that has a code in a register and
+// not a driver that knows which variant it is building.
+//
+// ```novo
+// use i2cfault
+// use i2cstatus
+//
+// fn main() [io]
+//     match i2cfault.fault_of(i2cstatus.I2C_STATUS_ADDRESS_NAK, 0x76, 0)
+//         Some(f) => println(i2cfault.fault_name(f))
+//         None    => println("no fault")
+// ```
+pub fn fault_of(status: Int, a: Int, b: Int) -> ?I2cFault []
+    todo("i2c-devices-nv.i2cfault.fault_of")
+
+// The status code a fault corresponds to.
+//
+// The inverse, for a caller that holds a fault and wants to ask
+// `i2cstatus`'s questions about it rather than repeating them here.
+pub fn status_of(f: I2cFault) -> Int []
+    todo("i2c-devices-nv.i2cfault.status_of")
+
+// The fault in words, for a log.
+//
+// ```novo
+// use i2cfault
+//
+// fn main() [io]
+//     println(i2cfault.fault_name(I2cFaultAddressNak(0x76)))
+// ```
+pub fn fault_name(f: I2cFault) -> Str []
+    todo("i2c-devices-nv.i2cfault.fault_name")
+
+// The address the fault concerns, or -1 for a fault that names none.
+//
+// `I2cFaultCrc`, `I2cFaultNotReady` and `I2cFaultResetValue` name none:
+// they are about the bytes, not about who sent them.
+pub fn fault_addr(f: I2cFault) -> Int []
+    todo("i2c-devices-nv.i2cfault.fault_addr")
+
+// Whether repeating the same transaction could succeed.
+//
+// `i2cstatus.is_transient` of this fault's code, so the two answers
+// cannot disagree.
+pub fn is_transient(f: I2cFault) -> Bool []
+    todo("i2c-devices-nv.i2cfault.is_transient")
+
+// Whether the fault is one a person has to fix with their hands.
+pub fn is_wiring(f: I2cFault) -> Bool []
+    todo("i2c-devices-nv.i2cfault.is_wiring")

@@ -1,0 +1,2063 @@
+// i2c_edge_tests.nv — what the interface suites leave unpinned: every
+// branch of the arithmetic against values computed outside this package,
+// and the order of the transactions each driver puts on the bus.
+//
+// THE BUS IS A SIMULATION WITH A LOG.  `SimBus` implements
+// `I2cDeviceBus[mutate]` over module-level state, because the trait's
+// methods take `self` by value and a bus that kept its own log could not
+// write it back (the same constraint `logging-nv`'s ring sink records).
+// Every transaction appends one integer to `bus_log`, the registers a
+// write touches are kept in `bus_mem` so a read finds them again, and
+// `bus_fail_at` makes the transaction with that number fail, so a driver
+// that does several things in a row is checked at each of its steps.
+//
+// WHERE A NUMBER IS EXPECTED, IT WAS COMPUTED APART FROM THIS PACKAGE:
+// the datasheet's published examples where there is one, and otherwise a
+// transcription of the datasheet's reference routine in another language.
+
+use std.test
+use bh1750
+use bme280
+use i2cbus
+use i2cfault
+use i2csample
+use i2cstatus
+use i2ctiming
+use ina219
+use sht3x
+
+// ── The simulated bus ────────────────────────────────────────────────
+
+// One integer per transaction, built by the `ev_*` functions below.
+var bus_log: [Int] = []
+// The register file a register read answers from and a register write
+// updates, one byte per entry.
+var bus_mem: [Int] = []
+// The answer to a read with no register pointer, the first byte off the
+// bus in the highest byte of the integer.
+var bus_raw: Int = 0
+// The number of the transaction that fails, counting from 1, or 0.
+var bus_fail_at: Int = 0
+// How many transactions have been made.
+var bus_count: Int = 0
+// The one address that acknowledges a presence probe, or -1.
+var bus_present: Int = -1
+// Whether a register read answers from `bus_wide`, where each register
+// number holds one sixteen-bit value, as the INA219's do, instead of from
+// `bus_mem`, where each holds one byte, as the BME280's do.
+var bus_is_wide: Bool = false
+var bus_wide: [Int]   = []
+
+struct SimBus
+    id: Int
+
+// The log entry of a register write.
+fn ev_write_reg(reg: Int, val: Int) -> Int
+    (1 << 40) | (reg << 16) | val
+
+// The log entry of a register read.
+fn ev_read_reg(reg: Int, n: Int) -> Int
+    (2 << 40) | (reg << 16) | n
+
+// The log entry of a write with no register pointer.
+fn ev_write_raw(bytes: Int, len: Int) -> Int
+    (3 << 40) | (len << 32) | bytes
+
+// The log entry of a read with no register pointer.
+fn ev_read_raw(n: Int) -> Int
+    (4 << 40) | n
+
+// The log entry of a presence probe.
+fn ev_present(addr: Int) -> Int
+    (5 << 40) | addr
+
+// Count a transaction, log it, and say whether it was the one made to
+// fail.
+fn step(entry: Int) -> Bool [mutate]
+    bus_count = bus_count + 1
+    list.push(bus_log, entry)
+    bus_count != bus_fail_at
+
+impl I2cDeviceBus[mutate] for SimBus
+    fn i2c_write_reg(self, addr: Int, reg: Int, val: Int) -> Bool [mutate]
+        if step(ev_write_reg(reg, val))
+            bus_mem[reg] = val
+            true
+        else
+            false
+
+    fn i2c_read_reg(self, addr: Int, reg: Int, n: Int) -> I2cWord [mutate]
+        if step(ev_read_reg(reg, n))
+            if bus_is_wide
+                i2cbus.word(bus_wide[reg], n)
+            else
+                var acc = 0
+                for k in 0..n
+                    acc = (acc << 8) | bus_mem[reg + k]
+                i2cbus.word(acc, n)
+        else
+            i2cbus.word_failed()
+
+    fn i2c_write_raw(self, addr: Int, bytes: Int, len: Int) -> Bool [mutate]
+        step(ev_write_raw(bytes, len))
+
+    fn i2c_read_raw(self, addr: Int, n: Int) -> I2cWord [mutate]
+        if step(ev_read_raw(n))
+            i2cbus.word(bus_raw >>> (64 - 8 * n), n)
+        else
+            i2cbus.word_failed()
+
+    fn i2c_present(self, addr: Int) -> Bool [mutate]
+        step(ev_present(addr)) and addr == bus_present
+
+    fn i2c_frequency(self) -> Int
+        400000
+
+// A clean bus: no log, 256 zero registers, no failure, nothing present.
+fn fresh_bus() -> SimBus [mutate]
+    bus_log = []
+    bus_mem = []
+    bus_wide = []
+    for _ in 0..256
+        list.push(bus_mem, 0)
+        list.push(bus_wide, 0)
+    bus_is_wide = false
+    bus_raw = 0
+    bus_fail_at = 0
+    bus_count = 0
+    bus_present = -1
+    SimBus { id: 0 }
+
+// Put `n` bytes, held in `bits` first byte highest, in the registers from
+// `reg`.
+fn load(reg: Int, bits: Int, n: Int) [mutate]
+    for k in 0..n
+        bus_mem[reg + k] = (bits >>> (8 * (n - 1 - k))) & 0xff
+
+// Put a sixteen-bit value in register number `reg` of a bus that holds
+// one value per register, and make register reads answer from there.
+fn load16(reg: Int, val: Int) [mutate]
+    bus_is_wide = true
+    bus_wide[reg] = val
+
+// The log, as a list of what was done.
+fn logged() -> [Int] [mutate]
+    bus_log
+
+// ── i2cbus: addresses and words ──────────────────────────────────────
+
+@test
+fn test_the_address_range_and_its_two_spellings_at_the_edges() [io]
+    test.case("the first and last address a part may use are inside, their neighbours are not")
+    test.assert(not i2cbus.addr_is_valid(i2cbus.I2C_ADDR_MIN - 1))
+    test.assert(i2cbus.addr_is_valid(i2cbus.I2C_ADDR_MIN))
+    test.assert(i2cbus.addr_is_valid(i2cbus.I2C_ADDR_MAX))
+    test.assert(not i2cbus.addr_is_valid(i2cbus.I2C_ADDR_MAX + 1))
+
+    test.case("the printed write address of each part in this package")
+    test.assert_eq(i2cbus.write_byte_of_addr(sht3x.SHT3X_ADDR_LOW), 0x88)
+    test.assert_eq(i2cbus.write_byte_of_addr(bh1750.BH1750_ADDR_LOW), 0x46)
+    test.assert_eq(i2cbus.write_byte_of_addr(ina219.INA219_ADDR_MIN), 0x80)
+    test.assert_eq(i2cbus.addr_from_write_byte(0x88), 0x44)
+
+    test.case("the read bit does not change the address, and the top bit is not one")
+    test.assert_eq(i2cbus.addr_from_write_byte(0xed), 0x76)
+    test.assert_eq(i2cbus.write_byte_of_addr(0x7f), 0xfe)
+
+@test
+fn test_a_word_holds_the_bytes_it_was_built_from_and_nothing_above_them() [io]
+    test.case("bits above the count are cleared")
+    let w = i2cbus.word(0xabcd1234, 2)
+    test.assert_eq(w.bits, 0x1234)
+    test.assert_eq(w.count, 2)
+    test.assert(w.ok)
+
+    test.case("a count below zero is no bytes and above eight is eight")
+    test.assert_eq(i2cbus.word(0x55, -3).count, 0)
+    test.assert_eq(i2cbus.word(0x55, -3).bits, 0)
+    test.assert_eq(i2cbus.word(0x55, 12).count, 8)
+    test.assert_eq(i2cbus.word(0x1122334455667788, 8).bits, 0x1122334455667788)
+
+    test.case("a failed word names an address that did not answer")
+    test.assert_eq(i2cbus.word_status(i2cbus.word_failed()), i2cstatus.I2C_STATUS_ADDRESS_NAK)
+    test.assert_eq(i2cbus.word_status(w), i2cstatus.I2C_STATUS_OK)
+
+@test
+fn test_a_byte_is_read_from_its_position_and_not_past_the_end() [io]
+    let w = i2cbus.word(0x112233445566, 6)
+
+    test.case("each position answers its byte, the first off the bus first")
+    test.assert_eq(i2cbus.byte_at(w, 0), 0x11)
+    test.assert_eq(i2cbus.byte_at(w, 3), 0x44)
+    test.assert_eq(i2cbus.byte_at(w, 5), 0x66)
+
+    test.case("a position outside the word answers zero")
+    test.assert_eq(i2cbus.byte_at(w, 6), 0)
+    test.assert_eq(i2cbus.byte_at(w, -1), 0)
+
+    test.case("a word of eight bytes reaches its last byte, which is the lowest")
+    test.assert_eq(i2cbus.byte_at(i2cbus.word(0x0102030405060708, 8), 7), 0x08)
+    test.assert_eq(i2cbus.byte_at(i2cbus.word(0x0102030405060708, 8), 0), 0x01)
+
+@test
+fn test_both_byte_orders_and_both_signs_at_every_boundary() [io]
+    let w = i2cbus.word(0x7fff8000, 4)
+
+    test.case("the largest positive and the most negative sixteen-bit values")
+    test.assert_eq(i2cbus.be_i16_at(w, 0), 32767)
+    test.assert_eq(i2cbus.be_i16_at(w, 2), -32768)
+
+    test.case("least significant byte first swaps them")
+    test.assert_eq(i2cbus.le_u16_at(w, 0), 0xff7f)
+    test.assert_eq(i2cbus.le_i16_at(w, 0), -129)
+    test.assert_eq(i2cbus.le_i16_at(w, 2), 128)
+
+    test.case("a read of the top bit of the second byte only")
+    test.assert_eq(i2cbus.be_u16_at(i2cbus.word(0x0080, 2), 0), 128)
+    test.assert_eq(i2cbus.be_i16_at(i2cbus.word(0x0080, 2), 0), 128)
+
+    test.case("twenty bits drop the low nibble of the third byte whatever it holds")
+    test.assert_eq(i2cbus.be_u20_at(i2cbus.word(0xabcdef, 3), 0), 0xabcde)
+    test.assert_eq(i2cbus.be_u20_at(i2cbus.word(0xabcd0f, 3), 0), 0xabcd0)
+
+// ── i2cbus: driving a bus ────────────────────────────────────────────
+
+@test
+fn test_a_register_read_is_one_transaction_of_the_asked_size() [io, mutate]
+    let b = fresh_bus()
+    load(0xd0, 0x60, 1)
+
+    test.case("a checked read names ok and the log holds exactly one read")
+    test.assert_eq(i2cbus.read_reg_checked(b, 0x76, 0xd0, 1), i2cstatus.I2C_STATUS_OK)
+    test.assert_eq(list.len(logged()), 1)
+    test.assert_eq(logged()[0], ev_read_reg(0xd0, 1))
+
+    test.case("a read byte is the register, and -1 on a bus that fails")
+    test.assert_eq(i2cbus.read_byte(b, 0x76, 0xd0), 0x60)
+    bus_fail_at = bus_count + 1
+    test.assert_eq(i2cbus.read_byte(b, 0x76, 0xd0), -1)
+    test.assert_eq(i2cbus.read_reg_checked(b, 0x76, 0xd0, 1), i2cstatus.I2C_STATUS_OK)
+
+@test
+fn test_a_chip_check_compares_the_byte_and_refuses_another_part() [io, mutate]
+    let b = fresh_bus()
+    load(0xd0, 0x58, 1)
+
+    test.case("a BMP280 is not a BME280")
+    test.assert(not i2cbus.chip_is(b, 0x76, 0xd0, 0x60))
+    test.assert(i2cbus.chip_is(b, 0x76, 0xd0, 0x58))
+
+    test.case("a part that did not answer is not any chip, not even one with id 0xff")
+    bus_fail_at = bus_count + 1
+    test.assert(not i2cbus.chip_is(b, 0x76, 0xd0, 0xff))
+
+@test
+fn test_a_register_update_clears_first_then_sets_and_keeps_the_rest() [io, mutate]
+    let b = fresh_bus()
+    load(0xf5, 0xb4, 1)
+
+    test.case("bits cleared and set in one write that follows one read")
+    test.assert(i2cbus.update_reg(b, 0x76, 0xf5, 0x1c, 0x08))
+    test.assert_eq(list.len(logged()), 2)
+    test.assert_eq(logged()[0], ev_read_reg(0xf5, 1))
+    // 0xb4 with 0x1c cleared is 0xa0, and 0x08 set is 0xa8.
+    test.assert_eq(logged()[1], ev_write_reg(0xf5, 0xa8))
+
+    test.case("a bit in both masks ends up set, because clear is applied first")
+    load(0xf5, 0x00, 1)
+    test.assert(i2cbus.update_reg(b, 0x76, 0xf5, 0x04, 0x04))
+    test.assert_eq(bus_mem[0xf5], 0x04)
+
+    test.case("the result stays one byte")
+    load(0xf5, 0x00, 1)
+    test.assert(i2cbus.update_reg(b, 0x76, 0xf5, 0, 0x1ff))
+    test.assert_eq(bus_mem[0xf5], 0xff)
+
+    test.case("a read that fails writes nothing")
+    let before = list.len(logged())
+    bus_fail_at = bus_count + 1
+    test.assert(not i2cbus.update_reg(b, 0x76, 0xf5, 0, 1))
+    test.assert_eq(list.len(logged()), before + 1)
+
+    test.case("and a write that is not acknowledged is reported")
+    bus_fail_at = bus_count + 2
+    test.assert(not i2cbus.update_reg(b, 0x76, 0xf5, 0, 1))
+
+@test
+fn test_a_scan_stops_at_the_first_answer_and_starts_no_lower_than_08() [io, mutate]
+    let b = fresh_bus()
+    bus_present = 0x40
+
+    test.case("it answers the first address that acknowledges and tries nothing after it")
+    test.assert_eq(i2cbus.scan_next(b, 0x08), 0x40)
+    // Addresses 0x08 through 0x40 inclusive: 57 probes.
+    test.assert_eq(list.len(logged()), 57)
+    test.assert_eq(logged()[0], ev_present(0x08))
+
+    test.case("a start below the range is the start of the range")
+    let b2 = fresh_bus()
+    bus_present = 0x40
+    test.assert_eq(i2cbus.scan_next(b2, -5), 0x40)
+    test.assert_eq(logged()[0], ev_present(0x08))
+
+    test.case("a start above the answer finds nothing, and tries up to the last address")
+    let b3 = fresh_bus()
+    bus_present = 0x40
+    test.assert_eq(i2cbus.scan_next(b3, 0x41), -1)
+    // Addresses 0x41 through 0x77 inclusive: 55 probes.
+    test.assert_eq(list.len(logged()), 55)
+
+    test.case("the last address is tried")
+    let b4 = fresh_bus()
+    bus_present = 0x77
+    test.assert_eq(i2cbus.scan_next(b4, 0x77), 0x77)
+
+// ── i2cstatus ────────────────────────────────────────────────────────
+
+@test
+fn test_every_code_has_the_retry_and_wiring_answer_the_design_gives_it() [io]
+    // Retried: a data NAK, a CRC mismatch and a read that was too early.
+    // Wiring: an address that did not answer and the wrong part.
+    test.case("the whole table, code by code")
+    let codes = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    let transient = [false, false, true, true, false, true, false, false, false]
+    let wiring = [false, true, false, false, true, false, false, false, false]
+    for k in 0..9
+        let c = codes[k]
+        test.assert_eq(i2cstatus.is_transient(c), transient[k])
+        test.assert_eq(i2cstatus.is_wiring(c), wiring[k])
+        test.assert_eq(i2cstatus.is_ok(c), k == 0)
+
+    test.case("a code outside the nine is nothing")
+    test.assert(not i2cstatus.is_transient(9))
+    test.assert(not i2cstatus.is_wiring(-1))
+    test.assert(not i2cstatus.is_ok(9))
+
+@test
+fn test_every_code_has_its_own_name_and_the_rest_are_unknown() [io]
+    test.case("nine names, all different")
+    let names = [i2cstatus.status_name(0), i2cstatus.status_name(1), i2cstatus.status_name(2),
+                 i2cstatus.status_name(3), i2cstatus.status_name(4), i2cstatus.status_name(5),
+                 i2cstatus.status_name(6), i2cstatus.status_name(7), i2cstatus.status_name(8)]
+    for i in 0..9
+        for j in 0..9
+            if i != j
+                test.assert(names[i] != names[j])
+    test.assert_eq(i2cstatus.status_name(0), "ok")
+    test.assert_eq(i2cstatus.status_name(1), "address not acknowledged")
+
+    test.case("a code that is none of them says so")
+    test.assert_eq(i2cstatus.status_name(9), "unknown status")
+    test.assert_eq(i2cstatus.status_name(-1), "unknown status")
+
+@test
+fn test_the_wait_left_is_the_conversion_less_the_wait_and_never_negative() [io]
+    test.case("a read that was too early is told what is left")
+    test.assert_eq(i2cstatus.retry_after_micros(i2cstatus.I2C_STATUS_NOT_READY, 15000, 14999), 1)
+
+    test.case("a wait that was long enough has nothing left, and so has an exact one")
+    test.assert_eq(i2cstatus.retry_after_micros(i2cstatus.I2C_STATUS_NOT_READY, 15000, 15000), 0)
+    test.assert_eq(i2cstatus.retry_after_micros(i2cstatus.I2C_STATUS_NOT_READY, 15000, 99999), 0)
+
+    test.case("only a read that was too early is told to wait")
+    for c in [0, 1, 2, 3, 4, 6, 7, 8]
+        test.assert_eq(i2cstatus.retry_after_micros(c, 15000, 0), 0)
+
+// ── i2cfault ─────────────────────────────────────────────────────────
+
+@test
+fn test_each_code_makes_its_own_fault_with_the_numbers_it_was_given() [io]
+    test.case("an address and nothing else for a NAK")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_DATA_NAK, 0x44, 7)
+        Some(I2cFaultDataNak(addr)) => test.assert_eq(addr, 0x44)
+        _                           => test.assert(false)
+
+    test.case("two checksums for a CRC mismatch")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_CRC, 0x92, 0x93)
+        Some(I2cFaultCrc(expected, got)) =>
+            test.assert_eq(expected, 0x92)
+            test.assert_eq(got, 0x93)
+        _                                => test.assert(false)
+
+    test.case("an address and an identification byte for the wrong part")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_WRONG_CHIP, 0x76, 0x58)
+        Some(I2cFaultWrongChip(addr, id)) =>
+            test.assert_eq(addr, 0x76)
+            test.assert_eq(id, 0x58)
+        _                                 => test.assert(false)
+
+    test.case("the wait for a read that was too early")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_NOT_READY, 9000, 0)
+        Some(I2cFaultNotReady(waited)) => test.assert_eq(waited, 9000)
+        _                              => test.assert(false)
+
+    test.case("an address for a missing calibration and for a saturated part")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_UNCALIBRATED, 0x40, 0)
+        Some(I2cFaultUncalibrated(addr)) => test.assert_eq(addr, 0x40)
+        _                                => test.assert(false)
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_SATURATED, 0x23, 0)
+        Some(I2cFaultSaturated(addr)) => test.assert_eq(addr, 0x23)
+        _                             => test.assert(false)
+
+    test.case("the raw word for a reset value")
+    match i2cfault.fault_of(i2cstatus.I2C_STATUS_RESET_VALUE, 0x80000, 0)
+        Some(I2cFaultResetValue(raw)) => test.assert_eq(raw, 0x80000)
+        _                             => test.assert(false)
+
+    test.case("a code that is none of them is no fault")
+    test.assert(i2cfault.fault_of(9, 1, 2) == None)
+    test.assert(i2cfault.fault_of(-1, 1, 2) == None)
+
+@test
+fn test_a_fault_gives_back_its_code_and_every_question_agrees_with_the_code() [io]
+    test.case("every code but zero round-trips through a fault")
+    for c in 1..9
+        match i2cfault.fault_of(c, 0x10, 0x20)
+            Some(f) =>
+                test.assert_eq(i2cfault.status_of(f), c)
+                test.assert_eq(i2cfault.is_transient(f), i2cstatus.is_transient(c))
+                test.assert_eq(i2cfault.is_wiring(f), i2cstatus.is_wiring(c))
+                test.assert_eq(i2cfault.fault_name(f), i2cstatus.status_name(c))
+            None    => test.assert(false)
+
+    test.case("the address is named by the five faults that carry one")
+    test.assert_eq(i2cfault.fault_addr(I2cFaultAddressNak(0x11)), 0x11)
+    test.assert_eq(i2cfault.fault_addr(I2cFaultDataNak(0x12)), 0x12)
+    test.assert_eq(i2cfault.fault_addr(I2cFaultWrongChip(0x13, 0x58)), 0x13)
+    test.assert_eq(i2cfault.fault_addr(I2cFaultUncalibrated(0x14)), 0x14)
+    test.assert_eq(i2cfault.fault_addr(I2cFaultSaturated(0x15)), 0x15)
+
+    test.case("and the three that are about bytes name none")
+    test.assert_eq(i2cfault.fault_addr(I2cFaultCrc(1, 2)), -1)
+    test.assert_eq(i2cfault.fault_addr(I2cFaultNotReady(5)), -1)
+    test.assert_eq(i2cfault.fault_addr(I2cFaultResetValue(5)), -1)
+
+// ── i2ctiming ────────────────────────────────────────────────────────
+
+@test
+fn test_the_millisecond_rounds_up_at_every_microsecond_but_the_exact_one() [io]
+    test.case("one microsecond over a millisecond is two")
+    test.assert_eq(i2ctiming.conversion_millis_ceil(i2ctiming.conversion(1)), 1)
+    test.assert_eq(i2ctiming.conversion_millis_ceil(i2ctiming.conversion(1000)), 1)
+    test.assert_eq(i2ctiming.conversion_millis_ceil(i2ctiming.conversion(1001)), 2)
+    test.assert_eq(i2ctiming.conversion_millis_ceil(i2ctiming.conversion(999)), 1)
+
+    test.case("no wait is no milliseconds, and so is a conversion that never started")
+    test.assert_eq(i2ctiming.conversion_millis_ceil(i2ctiming.immediate()), 0)
+    test.assert_eq(i2ctiming.conversion_millis_ceil(i2ctiming.not_started()), 0)
+
+    test.case("a negative number of microseconds is no wait")
+    test.assert_eq(i2ctiming.conversion(-7).micros, 0)
+    test.assert(i2ctiming.is_started(i2ctiming.conversion(-7)))
+
+@test
+fn test_the_wait_is_enough_at_the_boundary_and_one_microsecond_short_is_not() [io]
+    let c = i2ctiming.conversion(15000)
+
+    test.case("exactly the conversion time is elapsed, one microsecond less is not")
+    test.assert(i2ctiming.is_elapsed(c, 15000))
+    test.assert(not i2ctiming.is_elapsed(c, 14999))
+    test.assert_eq(i2ctiming.remaining_micros(c, 14999), 1)
+    test.assert_eq(i2ctiming.remaining_micros(c, 15000), 0)
+    test.assert_eq(i2ctiming.ready_status(c, 15000), i2cstatus.I2C_STATUS_OK)
+    test.assert_eq(i2ctiming.ready_status(c, 14999), i2cstatus.I2C_STATUS_NOT_READY)
+
+    test.case("a conversion of no time is elapsed with no wait at all")
+    test.assert(i2ctiming.is_elapsed(i2ctiming.immediate(), 0))
+
+@test
+fn test_a_conversion_that_never_started_is_never_elapsed() [io]
+    let none = i2ctiming.not_started()
+
+    test.case("however long the caller waits")
+    test.assert(not i2ctiming.is_started(none))
+    test.assert(not i2ctiming.is_elapsed(none, 0))
+    test.assert(not i2ctiming.is_elapsed(none, 3600000000))
+    test.assert_eq(i2ctiming.remaining_micros(none, 0), 0)
+    test.assert_eq(i2ctiming.ready_status(none, 3600000000), i2cstatus.I2C_STATUS_NOT_READY)
+
+    test.case("and the longest of it and a real conversion is the real one, in either order")
+    let real = i2ctiming.conversion(9000)
+    test.assert_eq(i2ctiming.longest(none, real).micros, 9000)
+    test.assert_eq(i2ctiming.longest(real, none).micros, 9000)
+
+    test.case("the longest of two real ones is the larger, in either order")
+    test.assert_eq(i2ctiming.longest(i2ctiming.conversion(120000), real).micros, 120000)
+    test.assert_eq(i2ctiming.longest(real, i2ctiming.conversion(120000)).micros, 120000)
+    test.assert_eq(i2ctiming.longest(real, i2ctiming.conversion(9000)).micros, 9000)
+
+// ── i2csample ────────────────────────────────────────────────────────
+
+@test
+fn test_every_quantity_has_a_unit_and_a_name_of_its_own() [io]
+    test.case("seven units and seven names")
+    let units = ["mC", "m%RH", "Pa", "mlx", "uV", "uA", "uW"]
+    let names = ["temperature", "humidity", "pressure", "illuminance", "voltage", "current", "power"]
+    for q in 0..7
+        test.assert_eq(i2csample.unit_name(q), units[q])
+        test.assert_eq(i2csample.quantity_name(q), names[q])
+
+    test.case("a quantity that is none of them")
+    test.assert_eq(i2csample.unit_name(7), "?")
+    test.assert_eq(i2csample.quantity_name(7), "unknown quantity")
+    test.assert_eq(i2csample.I2C_QUANTITIES, 7)
+
+@test
+fn test_a_value_on_either_edge_of_its_range_is_inside_and_one_past_is_not() [io]
+    test.case("the bounds of each quantity, as the part is specified")
+    let lows = [-40000, 0, 30000, 0, 0, -2147483648, 0]
+    let highs = [125000, 100000, 110000, 121600000, 32764000, 2147483647, 2147483647]
+    // The lists above are in the order temperature, humidity, pressure,
+    // illuminance, voltage, current, power.  Current has no floor that
+    // holds for every shunt, so the value below its minimum is not
+    // checked for it: -2147483648 is where the arithmetic would wrap.
+    let qs = [i2csample.I2C_Q_TEMPERATURE, i2csample.I2C_Q_HUMIDITY, i2csample.I2C_Q_PRESSURE,
+              i2csample.I2C_Q_ILLUMINANCE, i2csample.I2C_Q_VOLTAGE, i2csample.I2C_Q_CURRENT,
+              i2csample.I2C_Q_POWER]
+    for k in 0..7
+        let q = qs[k]
+        let lo = lows[k]
+        let hi = highs[k]
+        test.assert_eq(i2csample.quantity_min(q), lo)
+        test.assert_eq(i2csample.quantity_max(q), hi)
+        test.assert(i2csample.in_range(i2csample.sample(q, lo)))
+        test.assert(i2csample.in_range(i2csample.sample(q, hi)))
+        test.assert(not i2csample.in_range(i2csample.sample(q, hi + 1)))
+        if k != 5
+            test.assert(not i2csample.in_range(i2csample.sample(q, lo - 1)))
+
+    test.case("a quantity that is none of them has a range nothing is inside")
+    test.assert_eq(i2csample.quantity_min(9), 0)
+    test.assert_eq(i2csample.quantity_max(9), -1)
+    test.assert(not i2csample.in_range(i2csample.sample(9, 0)))
+
+@test
+fn test_a_sample_that_was_not_a_measurement_stays_one_whatever_its_value() [io]
+    test.case("range checking never makes an invalid sample valid")
+    let none = i2csample.no_sample(i2csample.I2C_Q_TEMPERATURE)
+    test.assert(not none.valid)
+    test.assert_eq(none.value, 0)
+    test.assert(not i2csample.range_checked(none).valid)
+
+    test.case("a valid sample outside its range loses its validity and keeps its value")
+    let hot = i2csample.range_checked(i2csample.sample(i2csample.I2C_Q_TEMPERATURE, 125001))
+    test.assert(not hot.valid)
+    test.assert_eq(hot.value, 125001)
+    test.assert_eq(hot.quantity, i2csample.I2C_Q_TEMPERATURE)
+
+@test
+fn test_a_printed_value_is_a_sign_a_whole_part_and_a_positive_fraction() [io]
+    test.case("zero, and the two values either side of it")
+    test.assert_eq(i2csample.whole(0), 0)
+    test.assert_eq(i2csample.milli_fraction(0), 0)
+    test.assert(not i2csample.is_negative(0))
+    test.assert_eq(i2csample.whole(-1), 0)
+    test.assert_eq(i2csample.milli_fraction(-1), 1)
+    test.assert(i2csample.is_negative(-1))
+
+    test.case("a whole number of units has no fraction in either sign")
+    test.assert_eq(i2csample.milli_fraction(-2000), 0)
+    test.assert_eq(i2csample.whole(-2000), -2)
+    test.assert_eq(i2csample.milli_fraction(999), 999)
+    test.assert_eq(i2csample.milli_fraction(1000), 0)
+
+// ── bme280 ───────────────────────────────────────────────────────────
+
+// Whether `a` is within `tol` of `b`.
+fn within(a: Int, b: Int, tol: Int) -> Bool
+    a - b <= tol and b - a <= tol
+
+// Fill the registers of a BME280 that holds the datasheet's example
+// calibration (§ 4.2.3: dig_T1 27504, dig_T2 26435, dig_T3 -1000, dig_P1
+// 36477, dig_P2 -10685, dig_P3 3024, dig_P4 2855, dig_P5 140, dig_P6 -7,
+// dig_P7 15500, dig_P8 -14600, dig_P9 6000), the humidity coefficients
+// of a typical part (dig_H1 75, dig_H2 366, dig_H3 0, dig_H4 310, dig_H5
+// 50, dig_H6 30), the identification byte, and the measurement block of
+// the datasheet's example: raw pressure 415148, raw temperature 519888
+// and raw humidity 30000.
+fn load_bme280() [mutate]
+    load(0x88, 0x706b436718fc7d8e, 8)
+    load(0x90, 0x43d6d00b270b8c00, 8)
+    load(0x98, 0xf9ff8c3cf8c67017, 8)
+    load(0xa0, 0x004b, 2)
+    load(0xe1, 0x6e01001326031e, 7)
+    load(0xd0, 0x60, 1)
+    load(0xf7, 0x655ac07eed007530, 8)
+
+@test
+fn test_the_datasheets_worked_example_comes_out_of_a_simulated_part() [io, mutate]
+    let b = fresh_bus()
+    load_bme280()
+
+    test.case("the calibration read from the registers is the one that was loaded")
+    let cal = bme280.read_calibration(b, 0x76)
+    test.assert(bme280.calibration_ok(cal))
+    test.assert(cal.has_humidity)
+    test.assert_eq(cal.temp.t1, 27504)
+    test.assert_eq(cal.temp.t2, 26435)
+    test.assert_eq(cal.temp.t3, -1000)
+    test.assert_eq(cal.press.p1, 36477)
+    test.assert_eq(cal.press.p2, -10685)
+    test.assert_eq(cal.press.p3, 3024)
+    test.assert_eq(cal.press.p4, 2855)
+    test.assert_eq(cal.press.p5, 140)
+    test.assert_eq(cal.press.p6, -7)
+    test.assert_eq(cal.press.p7, 15500)
+    test.assert_eq(cal.press.p8, -14600)
+    test.assert_eq(cal.press.p9, 6000)
+    test.assert_eq(cal.hum.h1, 75)
+    test.assert_eq(cal.hum.h2, 366)
+    test.assert_eq(cal.hum.h3, 0)
+    test.assert_eq(cal.hum.h4, 310)
+    test.assert_eq(cal.hum.h5, 50)
+    test.assert_eq(cal.hum.h6, 30)
+
+    test.case("a measurement waited for and read compensates to 25.08 C, 100653 Pa and 56.679 %RH")
+    let c = bme280.start_measurement(b, 0x76, bme280.weather_monitoring())
+    let raw = bme280.read_raw(b, 0x76, c, c.micros)
+    test.assert(raw.ok)
+    test.assert_eq(raw.press, 415148)
+    test.assert_eq(raw.temp, 519888)
+    test.assert_eq(raw.hum, 30000)
+    test.assert_eq(bme280.raw_status(raw), i2cstatus.I2C_STATUS_OK)
+    let r = bme280.compensate(cal, raw)
+    test.assert_eq(r.t_fine, 128422)
+    test.assert_eq(r.milli_c, 25080)
+    test.assert_eq(r.pascals, 100653)
+    test.assert_eq(r.milli_rh, 56679)
+    test.assert(r.temp_valid and r.press_valid and r.hum_valid)
+
+    test.case("each reaches the caller as a valid sample of its own quantity")
+    test.assert_eq(bme280.temperature(r).value, 25080)
+    test.assert_eq(bme280.pressure(r).value, 100653)
+    test.assert_eq(bme280.humidity(r).value, 56679)
+    test.assert(bme280.temperature(r).valid and bme280.pressure(r).valid and bme280.humidity(r).valid)
+
+@test
+fn test_the_calibration_is_read_in_the_order_and_sizes_the_part_documents() [io, mutate]
+    let b = fresh_bus()
+    load_bme280()
+
+    test.case("six transactions: the identity, then 0x88, 0x8e and 0x96 by eight, 0x9e by four, and 0xe1 by seven")
+    let cal = bme280.read_calibration(b, 0x76)
+    test.assert(bme280.calibration_ok(cal))
+    test.assert_eq(list.len(logged()), 6)
+    test.assert_eq(logged()[0], ev_read_reg(0xd0, 1))
+    test.assert_eq(logged()[1], ev_read_reg(0x88, 8))
+    test.assert_eq(logged()[2], ev_read_reg(0x8e, 8))
+    test.assert_eq(logged()[3], ev_read_reg(0x96, 8))
+    test.assert_eq(logged()[4], ev_read_reg(0x9e, 4))
+    test.assert_eq(logged()[5], ev_read_reg(0xe1, 7))
+
+    test.case("a transfer that fails at any of the six leaves no calibration")
+    for step in 1..7
+        let b2 = fresh_bus()
+        load_bme280()
+        bus_fail_at = step
+        test.assert(not bme280.calibration_ok(bme280.read_calibration(b2, 0x76)))
+        test.assert_eq(list.len(logged()), step)
+
+@test
+fn test_a_bmp280_is_read_without_its_humidity_block() [io, mutate]
+    let b = fresh_bus()
+    load_bme280()
+    load(0xd0, 0x58, 1)
+
+    test.case("five transactions, no humidity, and the coefficients that are there")
+    let cal = bme280.read_calibration(b, 0x76)
+    test.assert(bme280.calibration_ok(cal))
+    test.assert(not cal.has_humidity)
+    test.assert_eq(list.len(logged()), 5)
+    test.assert_eq(cal.hum.h1, 0)
+    test.assert_eq(cal.hum.h2, 0)
+    test.assert_eq(cal.press.p9, 6000)
+
+    test.case("a reading compensated with it has no humidity and has the other two")
+    let raw = bme280.raw_from(i2cbus.word(0x655ac07eed007530, 8))
+    let r = bme280.compensate(cal, raw)
+    test.assert(r.temp_valid and r.press_valid)
+    test.assert(not r.hum_valid)
+    test.assert_eq(r.milli_rh, 0)
+    test.assert_eq(r.pascals, 100653)
+
+    test.case("a part that is neither answers no calibration after one transaction")
+    let b2 = fresh_bus()
+    load_bme280()
+    load(0xd0, 0x61, 1)
+    test.assert(not bme280.calibration_ok(bme280.read_calibration(b2, 0x76)))
+    test.assert_eq(list.len(logged()), 1)
+
+@test
+fn test_a_part_is_identified_by_its_id_byte_and_by_nothing_else() [io, mutate]
+    let b = fresh_bus()
+    test.case("a BME280, a BMP280, another part, and a part that did not answer")
+    load(0xd0, 0x60, 1)
+    test.assert_eq(bme280.identify(b, 0x76), bme280.BME280_CHIP_ID)
+    load(0xd0, 0x58, 1)
+    test.assert_eq(bme280.identify(b, 0x76), bme280.BMP280_CHIP_ID)
+    load(0xd0, 0x61, 1)
+    test.assert_eq(bme280.identify(b, 0x76), -1)
+    load(0xd0, 0x60, 1)
+    bus_fail_at = bus_count + 1
+    test.assert_eq(bme280.identify(b, 0x76), -1)
+
+@test
+fn test_a_configuration_is_written_in_the_order_the_part_requires() [io, mutate]
+    let b = fresh_bus()
+
+    test.case("config, then ctrl_hum, then ctrl_meas, which is what makes ctrl_hum take effect")
+    test.assert(bme280.configure(b, 0x76, bme280.weather_monitoring()))
+    test.assert_eq(list.len(logged()), 3)
+    test.assert_eq(logged()[0], ev_write_reg(0xf5, 0x00))
+    test.assert_eq(logged()[1], ev_write_reg(0xf2, 0x01))
+    test.assert_eq(logged()[2], ev_write_reg(0xf4, 0x25))
+
+    test.case("a write that is not acknowledged stops the sequence there")
+    for step in 1..4
+        let b2 = fresh_bus()
+        bus_fail_at = step
+        test.assert(not bme280.configure(b2, 0x76, bme280.weather_monitoring()))
+        test.assert_eq(list.len(logged()), step)
+
+    test.case("the indoor settings pack to the bytes the datasheet's table gives")
+    let b3 = fresh_bus()
+    test.assert(bme280.configure(b3, 0x76, bme280.indoor_navigation()))
+    test.assert_eq(logged()[0], ev_write_reg(0xf5, 0x10))
+    test.assert_eq(logged()[1], ev_write_reg(0xf2, 0x01))
+    test.assert_eq(logged()[2], ev_write_reg(0xf4, 0x57))
+
+@test
+fn test_a_triggered_measurement_is_forced_whatever_the_configuration_says() [io, mutate]
+    let b = fresh_bus()
+
+    test.case("normal mode in the configuration is written as forced, and the wait is the configuration's")
+    let c = bme280.start_measurement(b, 0x76, bme280.indoor_navigation())
+    test.assert_eq(logged()[2], ev_write_reg(0xf4, 0x55))
+    test.assert_eq(c.micros, 46100)
+
+    test.case("a trigger that is not acknowledged is a measurement that never started")
+    let b2 = fresh_bus()
+    bus_fail_at = 3
+    let none = bme280.start_measurement(b2, 0x76, bme280.weather_monitoring())
+    test.assert(not i2ctiming.is_started(none))
+
+@test
+fn test_a_read_is_refused_until_the_wait_is_over_and_makes_no_transaction() [io, mutate]
+    let b = fresh_bus()
+    load_bme280()
+    let c = bme280.start_measurement(b, 0x76, bme280.weather_monitoring())
+    let before = list.len(logged())
+
+    test.case("a short wait answers a block that is not ok and does not touch the bus")
+    test.assert(not bme280.read_raw(b, 0x76, c, c.micros - 1).ok)
+    test.assert_eq(list.len(logged()), before)
+
+    test.case("the whole wait answers the block, in one read of eight bytes at 0xf7")
+    test.assert(bme280.read_raw(b, 0x76, c, c.micros).ok)
+    test.assert_eq(logged()[before], ev_read_reg(0xf7, 8))
+    test.assert_eq(list.len(logged()), before + 1)
+
+    test.case("a conversion that never started is refused however long the wait")
+    test.assert(not bme280.read_raw(b, 0x76, i2ctiming.not_started(), 3600000000).ok)
+    test.assert_eq(list.len(logged()), before + 1)
+
+    test.case("a read that fails is a block that is not ok, named as an address that did not answer")
+    bus_fail_at = bus_count + 1
+    let raw = bme280.read_raw(b, 0x76, c, c.micros)
+    test.assert(not raw.ok)
+    test.assert_eq(bme280.raw_status(raw), i2cstatus.I2C_STATUS_ADDRESS_NAK)
+
+@test
+fn test_the_status_register_answers_busy_and_ready_and_a_dead_bus_is_neither() [io, mutate]
+    let b = fresh_bus()
+
+    test.case("bit 3 is a measurement running and bit 0 the calibration image being copied")
+    load(0xf3, 0x08, 1)
+    test.assert(bme280.is_measuring(b, 0x76))
+    test.assert(bme280.is_calibration_ready(b, 0x76))
+    load(0xf3, 0x01, 1)
+    test.assert(not bme280.is_measuring(b, 0x76))
+    test.assert(not bme280.is_calibration_ready(b, 0x76))
+    load(0xf3, 0x00, 1)
+    test.assert(not bme280.is_measuring(b, 0x76))
+    test.assert(bme280.is_calibration_ready(b, 0x76))
+
+    test.case("a status that was not read says neither")
+    load(0xf3, 0x09, 1)
+    bus_fail_at = bus_count + 1
+    test.assert(not bme280.is_measuring(b, 0x76))
+    bus_fail_at = bus_count + 1
+    test.assert(not bme280.is_calibration_ready(b, 0x76))
+
+@test
+fn test_a_reset_writes_the_one_word_the_part_acts_on() [io, mutate]
+    let b = fresh_bus()
+    test.assert(bme280.reset(b, 0x76))
+    test.assert_eq(logged()[0], ev_write_reg(0xe0, 0xb6))
+    bus_fail_at = bus_count + 1
+    test.assert(not bme280.reset(b, 0x76))
+
+@test
+fn test_every_measurement_time_follows_the_datasheets_formula() [io]
+    test.case("1.25 ms plus 2.3 ms per sample, and 0.575 ms more for pressure and humidity")
+    test.assert_eq(bme280.conversion_time(bme280.weather_monitoring()).micros, 9300)
+    test.assert_eq(bme280.conversion_time(bme280.humidity_sensing()).micros, 6425)
+    test.assert_eq(bme280.conversion_time(bme280.indoor_navigation()).micros, 46100)
+
+    test.case("a skipped channel adds nothing")
+    let none = bme280.config(0, 0, 0, 0, 1)
+    test.assert_eq(bme280.conversion_time(none).micros, 1250)
+
+    test.case("the settings between ×2 and ×16 are 4 and 8 samples, and anything above 16")
+    let x4 = bme280.config(3, 0, 0, 0, 1)
+    test.assert_eq(bme280.conversion_time(x4).micros, 1250 + 2300 * 4)
+    let x8 = bme280.config(4, 0, 0, 0, 1)
+    test.assert_eq(bme280.conversion_time(x8).micros, 1250 + 2300 * 8)
+    let x16 = bme280.config(5, 0, 0, 0, 1)
+    test.assert_eq(bme280.conversion_time(x16).micros, 1250 + 2300 * 16)
+    let beyond = bme280.config(7, 0, 0, 0, 1)
+    test.assert_eq(bme280.conversion_time(beyond).micros, 1250 + 2300 * 16)
+
+@test
+fn test_the_control_bytes_are_packed_into_their_own_fields_only() [io]
+    test.case("each oversampling lands in its own bits")
+    let c = bme280.config(5, 2, 3, 4, 3)
+    test.assert_eq(bme280.ctrl_meas_byte(c), 0xa8 | 0x08 | 0x03 | 0x00 | 0x00)
+    test.assert_eq(bme280.ctrl_hum_byte(c), 3)
+    test.assert_eq(bme280.config_byte(c), 0x10)
+
+    test.case("a field that is too wide does not spill into its neighbour")
+    let wide = bme280.config(15, 15, 15, 15, 15)
+    test.assert_eq(bme280.ctrl_meas_byte(wide), 0xff)
+    test.assert_eq(bme280.ctrl_hum_byte(wide), 0x07)
+    test.assert_eq(bme280.config_byte(wide), 0x1c)
+
+@test
+fn test_the_calibration_words_come_out_with_their_signs_and_nibbles() [io]
+    test.case("the pressure coefficients, all nine, the last from its own word")
+    // dig_P1 1, dig_P2 -2, dig_P3 3, dig_P4 -4 from 0x8e; dig_P5 5,
+    // dig_P6 -6, dig_P7 7, dig_P8 -8 from 0x96; dig_P9 -9 from 0x9e.
+    let lo = i2cbus.word(0x0100feff0300fcff, 8)
+    let hi = i2cbus.word(0x0500faff0700f8ff, 8)
+    let p = bme280.press_cal_from(lo, hi)
+    test.assert_eq(p.p1, 1)
+    test.assert_eq(p.p2, -2)
+    test.assert_eq(p.p3, 3)
+    test.assert_eq(p.p4, -4)
+    test.assert_eq(p.p5, 5)
+    test.assert_eq(p.p6, -6)
+    test.assert_eq(p.p7, 7)
+    test.assert_eq(p.p8, -8)
+    test.assert_eq(p.p9, 0)
+    let full = bme280.press_cal_with_p9(p, i2cbus.word(0xf7ff1234, 4))
+    test.assert_eq(full.p9, -9)
+    test.assert_eq(full.p1, 1)
+    test.assert_eq(full.p8, -8)
+
+    test.case("dig_H4 and dig_H5 share a byte, and each is signed by the byte of its own")
+    // dig_H4 -300 is 0xed4: 0xfe in 0xe4 and 4 in the low nibble of 0xe5.
+    // dig_H5 -17 is 0xfef: 0xfe in 0xe6 and 0xf in the high nibble.
+    // dig_H2 -500 is 0xfe0c, dig_H3 100 and dig_H6 -5.
+    let h = bme280.hum_cal_from(75, i2cbus.word(0x0cfe64edf4fefb, 7))
+    test.assert_eq(h.h1, 75)
+    test.assert_eq(h.h2, -500)
+    test.assert_eq(h.h3, 100)
+    test.assert_eq(h.h4, -300)
+    test.assert_eq(h.h5, -17)
+    test.assert_eq(h.h6, -5)
+
+    test.case("a positive pair, to prove the nibbles are not swapped")
+    // dig_H4 310 is 0x136 and dig_H5 50 is 0x032.
+    let q = bme280.hum_cal_from(75, i2cbus.word((0x6e0100132603 << 8) | 0x1e, 7))
+    test.assert_eq(q.h4, 310)
+    test.assert_eq(q.h5, 50)
+    test.assert_eq(q.h6, 30)
+
+@test
+fn test_a_raw_block_is_eight_bytes_and_each_field_comes_from_its_own_three() [io]
+    test.case("pressure, temperature and humidity out of one block")
+    let r = bme280.raw_from(i2cbus.word(0x655ac07eed007530, 8))
+    test.assert(r.ok)
+    test.assert_eq(r.press, 415148)
+    test.assert_eq(r.temp, 519888)
+    test.assert_eq(r.hum, 30000)
+
+    test.case("seven bytes is not a block, and neither is nine")
+    test.assert(not bme280.raw_from(i2cbus.word(0x655ac07eed0075, 7)).ok)
+    test.assert(not bme280.raw_from(i2cbus.word_failed()).ok)
+
+    test.case("a block that failed has no fields")
+    let bad = bme280.raw_from(i2cbus.word(0x655ac07eed0075, 7))
+    test.assert_eq(bad.press, 0)
+    test.assert_eq(bad.temp, 0)
+    test.assert_eq(bad.hum, 0)
+
+@test
+fn test_a_reset_value_in_any_field_is_named_and_a_near_miss_is_not() [io]
+    test.case("the three fields, one at a time, and a value one off")
+    let ok = i2cbus.word(0x655ac07eed007530, 8)
+    test.assert_eq(bme280.raw_status(bme280.raw_from(ok)), i2cstatus.I2C_STATUS_OK)
+    test.assert_eq(bme280.raw_status(bme280.raw_from(i2cbus.word(0x800000_7eed007530, 8))),
+                   i2cstatus.I2C_STATUS_RESET_VALUE)
+    test.assert_eq(bme280.raw_status(bme280.raw_from(i2cbus.word(0x655ac0_800000_7530, 8))),
+                   i2cstatus.I2C_STATUS_RESET_VALUE)
+    test.assert_eq(bme280.raw_status(bme280.raw_from(i2cbus.word(0x655ac07eed008000, 8))),
+                   i2cstatus.I2C_STATUS_RESET_VALUE)
+    test.assert_eq(bme280.raw_status(bme280.raw_from(i2cbus.word(0x655ac07eed008001, 8))),
+                   i2cstatus.I2C_STATUS_OK)
+    test.assert(not bme280.raw_is_reset(0x80001))
+    test.assert(not bme280.raw_is_reset(0x7ffff))
+
+@test
+fn test_a_pressure_whose_divisor_comes_to_zero_is_refused_and_not_divided() [io]
+    // dig_P2 -32768 against a t_fine of 1176576, so that `t` is 2^20 and
+    // the second-order term is -2^47: exactly what cancels the 2^47 the
+    // divisor is built on.  No part has this calibration; a corrupted
+    // read could, and a division by it is a trap.
+    let pcal = bme280.press_cal_with_p9(
+        bme280.press_cal_from(i2cbus.word(0x0100008000000000, 8), i2cbus.word(0, 8)), i2cbus.word(0, 2))
+    test.assert_eq(pcal.p1, 1)
+    test.assert_eq(pcal.p2, -32768)
+    let r = I2cBmeReading { milli_c: 0, pascals: 0, milli_rh: 0, t_fine: 1176576,
+                            temp_valid: true, press_valid: false, hum_valid: false }
+
+    test.case("the reading comes back with no pressure, and the temperature it had")
+    let out = bme280.compensate_pressure(r, pcal, 415148)
+    test.assert(not out.press_valid)
+    test.assert(out.temp_valid)
+    test.assert_eq(out.pascals, 0)
+    test.assert_eq(out.t_fine, 1176576)
+
+    test.case("one count over, the divisor is -1 and the pressure it gives is outside any range, so it is refused as well")
+    let near = I2cBmeReading { milli_c: 0, pascals: 0, milli_rh: 0, t_fine: 1176577,
+                               temp_valid: true, press_valid: false, hum_valid: false }
+    test.assert(not bme280.compensate_pressure(near, pcal, 415148).press_valid)
+
+@test
+fn test_a_compensation_that_cannot_be_trusted_is_refused_and_says_which() [io]
+    let tcal = bme280.temp_cal_from(i2cbus.word(0x706b436718fc, 6))
+    let pcal = bme280.press_cal_with_p9(
+        bme280.press_cal_from(i2cbus.word(0x7d8e43d6d00b270b, 8), i2cbus.word(0x8c00f9ff8c3cf8c6, 8)),
+        i2cbus.word(0x7017, 2))
+    let hcal = bme280.hum_cal_from(75, i2cbus.word((0x6e0100132603 << 8) | 0x1e, 7))
+    let t = bme280.compensate_temperature(tcal, 519888)
+
+    test.case("the datasheet's pressure against the datasheet's temperature")
+    let p = bme280.compensate_pressure(t, pcal, 415148)
+    test.assert(p.press_valid)
+    test.assert_eq(p.pascals, 100653)
+    test.assert_eq(p.milli_c, 25080)
+
+    test.case("a pressure of the reset value is not compensated")
+    let skipped = bme280.compensate_pressure(t, pcal, 0x80000)
+    test.assert(not skipped.press_valid)
+    test.assert_eq(skipped.pascals, 0)
+    test.assert(skipped.temp_valid)
+
+    test.case("nor is one with a dig_P1 of zero, which is a divisor")
+    let zero_p1 = bme280.press_cal_with_p9(
+        bme280.press_cal_from(i2cbus.word(0x0000, 8), i2cbus.word(0, 8)), i2cbus.word(0, 2))
+    test.assert(not bme280.compensate_pressure(t, zero_p1, 415148).press_valid)
+
+    test.case("nor one against a temperature that was a reset value")
+    let no_t = bme280.compensate_temperature(tcal, 0x80000)
+    test.assert(not no_t.temp_valid)
+    test.assert_eq(no_t.t_fine, 0)
+    test.assert(not bme280.compensate_pressure(no_t, pcal, 415148).press_valid)
+    test.assert(not bme280.compensate_humidity(no_t, hcal, 30000).hum_valid)
+
+    test.case("a humidity of the reset value is not compensated, and its neighbour is")
+    test.assert(not bme280.compensate_humidity(t, hcal, 0x8000).hum_valid)
+    test.assert(bme280.compensate_humidity(t, hcal, 0x8001).hum_valid)
+
+    test.case("compensating humidity keeps what the earlier steps found")
+    let both = bme280.compensate_humidity(p, hcal, 30000)
+    test.assert(both.press_valid and both.hum_valid)
+    test.assert_eq(both.pascals, 100653)
+    test.assert_eq(both.milli_rh, 56679)
+    let refused = bme280.compensate_humidity(p, hcal, 0x8000)
+    test.assert_eq(refused.pascals, 100653)
+    test.assert(refused.press_valid)
+
+@test
+fn test_the_humidity_routine_clamps_at_both_ends_and_follows_the_reference() [io]
+    let tcal = bme280.temp_cal_from(i2cbus.word(0x706b436718fc, 6))
+    let hcal = bme280.hum_cal_from(75, i2cbus.word((0x6e0100132603 << 8) | 0x1e, 7))
+    let t = bme280.compensate_temperature(tcal, 519888)
+
+    test.case("raw values and the percentages the reference routine gives for them")
+    test.assert_eq(bme280.compensate_humidity(t, hcal, 30000).milli_rh, 56679)
+    test.assert_eq(bme280.compensate_humidity(t, hcal, 28000).milli_rh, 45420)
+    test.assert_eq(bme280.compensate_humidity(t, hcal, 36000).milli_rh, 90232)
+
+    test.case("a saturated sensor reads exactly 100 percent")
+    test.assert_eq(bme280.compensate_humidity(t, hcal, 0xffff).milli_rh, 100000)
+
+    test.case("a raw value below the part's floor reads zero and is still a measurement")
+    let dry = bme280.compensate_humidity(t, hcal, 5000)
+    test.assert_eq(dry.milli_rh, 0)
+    test.assert(dry.hum_valid)
+
+    test.case("a raw value a hair under the floor reads zero, and one a hair over reads 0.010 percent")
+    // The routine's result is -191716 here and 47929 at 19999, in its own
+    // units; it is clamped to zero from below, not rounded to a small
+    // negative percentage.
+    test.assert_eq(bme280.compensate_humidity(t, hcal, 19990).milli_rh, 0)
+    test.assert_eq(bme280.compensate_humidity(t, hcal, 19999).milli_rh, 10)
+
+@test
+fn test_the_temperature_routine_follows_the_reference_above_and_below_the_example() [io]
+    let tcal = bme280.temp_cal_from(i2cbus.word(0x706b436718fc, 6))
+
+    test.case("raw values either side of the datasheet's example, in thousandths of a degree")
+    test.assert_eq(bme280.compensate_temperature(tcal, 400000).milli_c, -12640)
+    test.assert_eq(bme280.compensate_temperature(tcal, 400000).t_fine, -64736)
+    test.assert_eq(bme280.compensate_temperature(tcal, 600000).milli_c, 50110)
+    test.assert_eq(bme280.compensate_temperature(tcal, 0x80001).milli_c, 26460)
+
+    test.case("a pressure against another temperature follows the reference too")
+    let pcal = bme280.press_cal_with_p9(
+        bme280.press_cal_from(i2cbus.word(0x7d8e43d6d00b270b, 8), i2cbus.word(0x8c00f9ff8c3cf8c6, 8)),
+        i2cbus.word(0x7017, 2))
+    let cold = bme280.compensate_temperature(tcal, 400000)
+    test.assert_eq(bme280.compensate_pressure(cold, pcal, 415148).pascals, 94916)
+    let warm = bme280.compensate_temperature(tcal, 600000)
+    test.assert_eq(bme280.compensate_pressure(warm, pcal, 415148).pascals, 104527)
+
+@test
+fn test_a_calibration_or_a_block_that_is_not_usable_gives_no_reading() [io]
+    let good_raw = bme280.raw_from(i2cbus.word(0x655ac07eed007530, 8))
+
+    test.case("no calibration, and a calibration that was read but is all zeros")
+    let none = bme280.compensate(bme280.no_calibration(), good_raw)
+    test.assert(not (none.temp_valid or none.press_valid or none.hum_valid))
+    test.assert_eq(none.milli_c, 0)
+    test.assert_eq(none.t_fine, 0)
+    test.assert(not bme280.calibration_ok(bme280.no_calibration()))
+
+    test.case("a good calibration and a block that failed")
+    let b = fresh_bus()
+    load_bme280()
+    let cal = bme280.read_calibration(b, 0x76)
+    let bad = bme280.compensate(cal, bme280.raw_from(i2cbus.word_failed()))
+    test.assert(not (bad.temp_valid or bad.press_valid or bad.hum_valid))
+
+    test.case("a calibration whose dig_T1 or dig_P1 is zero is not usable")
+    test.assert(not bme280.calibration_ok(I2cBmeCalib { temp: I2cBmeTempCal { t1: 0, t2: 1, t3: 1 },
+                                                         press: cal.press, hum: cal.hum,
+                                                         ok: true, has_humidity: true }))
+    test.assert(not bme280.calibration_ok(I2cBmeCalib { temp: cal.temp,
+                                                         press: I2cBmePressCal { p1: 0, p2: 1, p3: 1, p4: 1, p5: 1,
+                                                                                 p6: 1, p7: 1, p8: 1, p9: 1 },
+                                                         hum: cal.hum, ok: true, has_humidity: true }))
+    test.assert(not bme280.calibration_ok(I2cBmeCalib { temp: cal.temp, press: cal.press, hum: cal.hum,
+                                                         ok: false, has_humidity: true }))
+
+@test
+fn test_a_sample_is_valid_only_when_its_value_is_inside_the_range_the_part_is_specified_for() [io]
+    test.case("a pressure below 300 hPa and one above 1100 hPa are not measurements")
+    let low = I2cBmeReading { milli_c: 20000, pascals: 29999, milli_rh: 50000, t_fine: 0,
+                              temp_valid: true, press_valid: true, hum_valid: true }
+    test.assert(not bme280.pressure(low).valid)
+    test.assert_eq(bme280.pressure(low).value, 29999)
+    let high = I2cBmeReading { milli_c: 20000, pascals: 110001, milli_rh: 50000, t_fine: 0,
+                               temp_valid: true, press_valid: true, hum_valid: true }
+    test.assert(not bme280.pressure(high).valid)
+
+    test.case("a temperature of 180 C, which a byte-swapped coefficient gives, is not a measurement")
+    let hot = I2cBmeReading { milli_c: 180000, pascals: 100000, milli_rh: 50000, t_fine: 0,
+                              temp_valid: true, press_valid: true, hum_valid: true }
+    test.assert(not bme280.temperature(hot).valid)
+    test.assert(bme280.humidity(hot).valid)
+
+    test.case("a value that was not compensated is not a sample, whatever it holds")
+    let off = I2cBmeReading { milli_c: 20000, pascals: 100000, milli_rh: 50000, t_fine: 0,
+                              temp_valid: false, press_valid: false, hum_valid: false }
+    test.assert(not bme280.temperature(off).valid)
+    test.assert(not bme280.pressure(off).valid)
+    test.assert(not bme280.humidity(off).valid)
+    test.assert_eq(bme280.humidity(off).quantity, i2csample.I2C_Q_HUMIDITY)
+    test.assert_eq(bme280.temperature(off).quantity, i2csample.I2C_Q_TEMPERATURE)
+
+@test
+fn test_the_pressure_at_sea_level_follows_the_barometric_formula() [io]
+    test.case("a pressure at sea level is unchanged, and a mountain's is corrected up")
+    test.assert_eq(bme280.sea_level_pressure(101325, 0), 101325)
+    test.assert(within(bme280.sea_level_pressure(89875, 1000), 101324, 5))
+    test.assert(within(bme280.sea_level_pressure(50000, 5500), 100298, 5))
+
+    test.case("below sea level it is corrected down")
+    test.assert(within(bme280.sea_level_pressure(95000, -500), 89563, 5))
+
+    test.case("an altitude outside -1000 to 11000 m is held to the nearest end")
+    test.assert_eq(bme280.sea_level_pressure(101325, 20000), bme280.sea_level_pressure(101325, 11000))
+    test.assert_eq(bme280.sea_level_pressure(101325, -5000), bme280.sea_level_pressure(101325, -1000))
+
+    test.case("and inside it the formula holds at both ends, for the pressure the formula gives there")
+    test.assert(within(bme280.sea_level_pressure(22637, 11000), 101325, 8))
+    test.assert(within(bme280.sea_level_pressure(113927, -1000), 101325, 8))
+
+// ── sht3x ────────────────────────────────────────────────────────────
+
+@test
+fn test_the_checksum_matches_the_published_value_and_five_more() [io]
+    test.case("the datasheet's own check value, and the values the same polynomial gives elsewhere")
+    test.assert_eq(sht3x.crc8(0xbe, 0xef), 0x92)
+    test.assert_eq(sht3x.crc8(0x00, 0x00), 0x81)
+    test.assert_eq(sht3x.crc8(0x66, 0x66), 0x93)
+    test.assert_eq(sht3x.crc8(0xff, 0xff), 0xac)
+    test.assert_eq(sht3x.crc8(0x80, 0x00), 0xa2)
+    test.assert_eq(sht3x.crc8(0x12, 0x34), 0x37)
+
+    test.case("the bytes are not interchangeable, and one wrong bit is noticed")
+    test.assert(sht3x.crc8(0xef, 0xbe) != 0x92)
+    test.assert(not sht3x.crc_ok(0xbe, 0xee, 0x92))
+    test.assert(not sht3x.crc_ok(0xbe, 0xef, 0x93))
+    test.assert(sht3x.crc_ok(0x00, 0x10, 0xc2))
+
+@test
+fn test_each_repeatability_has_its_command_and_its_wait_and_no_other_value_is_one() [io]
+    test.case("0x2400, 0x240b and 0x2416, and waits of 15.5, 6.5 and 4.5 ms")
+    test.assert_eq(sht3x.measure_command(0), 0x2400)
+    test.assert_eq(sht3x.measure_command(1), 0x240b)
+    test.assert_eq(sht3x.measure_command(2), 0x2416)
+    test.assert_eq(sht3x.conversion_time(0).micros, 15500)
+    test.assert_eq(sht3x.conversion_time(1).micros, 6500)
+    test.assert_eq(sht3x.conversion_time(2).micros, 4500)
+
+    test.case("a value that is none of them is the most repeatable, in command and wait alike")
+    test.assert_eq(sht3x.measure_command(7), 0x2400)
+    test.assert_eq(sht3x.conversion_time(7).micros, 15500)
+
+@test
+fn test_the_status_word_is_read_bit_by_bit_and_named_by_its_worst_bit() [io]
+    test.case("the two bits a program acts on")
+    test.assert(sht3x.status_was_reset(0x0010))
+    test.assert(sht3x.status_was_reset(0xffff))
+    test.assert(not sht3x.status_was_reset(0xffef))
+    test.assert(sht3x.status_heater_on(0x2000))
+    test.assert(not sht3x.status_heater_on(0xdfff))
+
+    test.case("each condition alone has its own phrase")
+    test.assert_eq(sht3x.status_name(0x0001), "last write checksum failed")
+    test.assert_eq(sht3x.status_name(0x0002), "last command not processed")
+    test.assert_eq(sht3x.status_name(0x0010), "part restarted")
+    test.assert_eq(sht3x.status_name(0x8000), "alert pending")
+    test.assert_eq(sht3x.status_name(0x2000), "heater on")
+    test.assert_eq(sht3x.status_name(0x0000), "no flag set")
+
+    test.case("with several set, the worst is the one named, in the order the header gives")
+    test.assert_eq(sht3x.status_name(0xa013), "last write checksum failed")
+    test.assert_eq(sht3x.status_name(0xa012), "last command not processed")
+    test.assert_eq(sht3x.status_name(0xa010), "part restarted")
+    test.assert_eq(sht3x.status_name(0xa000), "alert pending")
+
+@test
+fn test_a_reply_is_checked_word_by_word_and_names_what_failed() [io]
+    test.case("six bytes with both checksums right")
+    let good = sht3x.reply_from(i2cbus.word(0x666693_8000a2, 6))
+    test.assert(sht3x.reply_ok(good))
+    test.assert_eq(good.raw_temp, 0x6666)
+    test.assert_eq(good.raw_hum, 0x8000)
+    test.assert_eq(sht3x.reply_status(good), i2cstatus.I2C_STATUS_OK)
+
+    test.case("only the temperature checksum wrong")
+    let t_bad = sht3x.reply_from(i2cbus.word(0x666692_8000a2, 6))
+    test.assert(not t_bad.temp_crc_ok)
+    test.assert(t_bad.hum_crc_ok)
+    test.assert(not sht3x.reply_ok(t_bad))
+    test.assert_eq(sht3x.reply_status(t_bad), i2cstatus.I2C_STATUS_CRC)
+
+    test.case("only the humidity checksum wrong")
+    let h_bad = sht3x.reply_from(i2cbus.word(0x666693_8000a3, 6))
+    test.assert(h_bad.temp_crc_ok)
+    test.assert(not h_bad.hum_crc_ok)
+    test.assert_eq(sht3x.reply_status(h_bad), i2cstatus.I2C_STATUS_CRC)
+
+    test.case("five bytes is not a reply, even with checksums that agree")
+    let short = sht3x.reply_from(i2cbus.word(0x666693_8000, 5))
+    test.assert(not short.ok)
+    test.assert(not sht3x.reply_ok(short))
+    test.assert_eq(sht3x.reply_status(short), i2cstatus.I2C_STATUS_DATA_NAK)
+    test.assert_eq(short.raw_temp, 0)
+
+@test
+fn test_the_two_conversions_round_to_the_nearest_thousandth_and_ignore_high_bits() [io]
+    test.case("temperature across the range")
+    test.assert_eq(sht3x.temperature_of(0), -45000)
+    test.assert_eq(sht3x.temperature_of(1), -44997)
+    test.assert_eq(sht3x.temperature_of(0x1234), -32556)
+    test.assert_eq(sht3x.temperature_of(0x6666), 25000)
+    test.assert_eq(sht3x.temperature_of(0x8000), 42501)
+    test.assert_eq(sht3x.temperature_of(0xffff), 130000)
+
+    test.case("humidity across the range")
+    test.assert_eq(sht3x.humidity_of(0), 0)
+    test.assert_eq(sht3x.humidity_of(1), 2)
+    test.assert_eq(sht3x.humidity_of(0x1234), 7111)
+    test.assert_eq(sht3x.humidity_of(0x6666), 40000)
+    test.assert_eq(sht3x.humidity_of(0x8000), 50001)
+    test.assert_eq(sht3x.humidity_of(0xffff), 100000)
+
+    test.case("bits above sixteen are not part of the word")
+    test.assert_eq(sht3x.temperature_of(0x16666), 25000)
+    test.assert_eq(sht3x.humidity_of(0x1ffff), 100000)
+
+@test
+fn test_a_checked_reply_becomes_a_reading_and_its_samples_are_range_checked() [io]
+    test.case("a reply that checks out gives both numbers and a valid reading")
+    let r = sht3x.reading_of(sht3x.reply_from(i2cbus.word(0x666693_8000a2, 6)))
+    test.assert(r.valid)
+    test.assert_eq(r.milli_c, 25000)
+    test.assert_eq(r.milli_rh, 50001)
+    test.assert_eq(sht3x.temperature(r).value, 25000)
+    test.assert_eq(sht3x.humidity(r).value, 50001)
+    test.assert(sht3x.temperature(r).valid and sht3x.humidity(r).valid)
+    test.assert_eq(sht3x.temperature(r).quantity, i2csample.I2C_Q_TEMPERATURE)
+
+    test.case("a temperature below what the part is specified for is a reading but not a sample")
+    let cold = I2cShtReading { milli_c: -45000, milli_rh: 1000, valid: true }
+    test.assert(not sht3x.temperature(cold).valid)
+    test.assert_eq(sht3x.temperature(cold).value, -45000)
+    test.assert(sht3x.humidity(cold).valid)
+
+    test.case("a reply with a bad checksum gives neither, valid or not")
+    let bad = sht3x.reading_of(sht3x.reply_from(i2cbus.word(0x666692_8000a2, 6)))
+    test.assert(not bad.valid)
+    test.assert(not sht3x.temperature(bad).valid)
+    test.assert(not sht3x.humidity(bad).valid)
+
+@test
+fn test_the_dew_point_follows_the_magnus_formula_and_is_refused_where_it_does_not_hold() [io]
+    test.case("values the formula gives, to within two thousandths of a degree")
+    let a = I2cShtReading { milli_c: 25000, milli_rh: 50000, valid: true }
+    test.assert(within(sht3x.dew_point(a), 13852, 2))
+    let b = I2cShtReading { milli_c: 5000, milli_rh: 80000, valid: true }
+    test.assert(within(sht3x.dew_point(b), 1834, 2))
+    let c = I2cShtReading { milli_c: 25000, milli_rh: 80000, valid: true }
+    test.assert(within(sht3x.dew_point(c), 21307, 2))
+    let d = I2cShtReading { milli_c: -20000, milli_rh: 50000, valid: true }
+    test.assert(within(sht3x.dew_point(d), -27775, 2))
+    let e = I2cShtReading { milli_c: 60000, milli_rh: 20000, valid: true }
+    test.assert(within(sht3x.dew_point(e), 29009, 2))
+    let f = I2cShtReading { milli_c: 0, milli_rh: 1000, valid: true }
+    test.assert(within(sht3x.dew_point(f), -50376, 2))
+
+    test.case("the same temperature is a lower dew point in drier air, and 80 %RH at 5 C is not 80 %RH at 25 C")
+    test.assert(sht3x.dew_point(a) < sht3x.dew_point(c))
+    test.assert(sht3x.dew_point(b) < sht3x.dew_point(c) - 15000)
+
+    test.case("at saturation the dew point is the temperature and never above it")
+    let wet = I2cShtReading { milli_c: 25000, milli_rh: 100000, valid: true }
+    test.assert_eq(sht3x.dew_point(wet), 25000)
+    let hot_wet = I2cShtReading { milli_c: 60000, milli_rh: 100000, valid: true }
+    test.assert_eq(sht3x.dew_point(hot_wet), 60000)
+
+    test.case("a humidity above 100 percent, which the part cannot report, is held at the temperature")
+    let over = I2cShtReading { milli_c: 25000, milli_rh: 110000, valid: true }
+    test.assert_eq(sht3x.dew_point(over), 25000)
+
+    test.case("a reading that is not valid, no humidity, and a temperature off the specified range answer zero")
+    test.assert_eq(sht3x.dew_point(I2cShtReading { milli_c: 25000, milli_rh: 50000, valid: false }), 0)
+    test.assert_eq(sht3x.dew_point(I2cShtReading { milli_c: 25000, milli_rh: 0, valid: true }), 0)
+    test.assert_eq(sht3x.dew_point(I2cShtReading { milli_c: -45001, milli_rh: 50000, valid: true }), 0)
+    test.assert_eq(sht3x.dew_point(I2cShtReading { milli_c: 60001, milli_rh: 50000, valid: true }), 0)
+
+    test.case("and the two ends of the range are inside it")
+    test.assert(sht3x.dew_point(I2cShtReading { milli_c: -45000, milli_rh: 50000, valid: true }) != 0)
+    test.assert(sht3x.dew_point(I2cShtReading { milli_c: 60000, milli_rh: 50000, valid: true }) != 0)
+
+@test
+fn test_a_command_is_two_bytes_with_no_register_pointer() [io, mutate]
+    let b = fresh_bus()
+    test.case("the command, most significant byte first, as a two-byte raw write")
+    test.assert(sht3x.command(b, 0x44, 0x2400))
+    test.assert_eq(logged()[0], ev_write_raw(0x2400, 2))
+
+    test.case("a write that is not acknowledged is reported")
+    bus_fail_at = bus_count + 1
+    test.assert(not sht3x.command(b, 0x44, 0x2400))
+
+@test
+fn test_a_reset_breaks_out_of_periodic_mode_before_it_resets() [io, mutate]
+    let b = fresh_bus()
+    test.case("break first, then the soft reset")
+    test.assert(sht3x.reset(b, 0x44))
+    test.assert_eq(list.len(logged()), 2)
+    test.assert_eq(logged()[0], ev_write_raw(0x3093, 2))
+    test.assert_eq(logged()[1], ev_write_raw(0x30a2, 2))
+
+    test.case("a break that is not acknowledged ends it, and the reset is never sent")
+    let b2 = fresh_bus()
+    bus_fail_at = 1
+    test.assert(not sht3x.reset(b2, 0x44))
+    test.assert_eq(list.len(logged()), 1)
+
+    test.case("a reset that is not acknowledged is reported")
+    let b3 = fresh_bus()
+    bus_fail_at = 2
+    test.assert(not sht3x.reset(b3, 0x44))
+
+@test
+fn test_the_status_register_is_read_with_its_checksum_or_not_at_all() [io, mutate]
+    test.case("a status word and its checksum read as three bytes after the read-status command")
+    let b = fresh_bus()
+    bus_raw = 0x0010c20000000000
+    test.assert_eq(sht3x.read_status(b, 0x44), 0x0010)
+    test.assert_eq(logged()[0], ev_write_raw(0xf32d, 2))
+    test.assert_eq(logged()[1], ev_read_raw(3))
+
+    test.case("a checksum that disagrees is a status that was not read")
+    let b2 = fresh_bus()
+    bus_raw = 0x0010c30000000000
+    test.assert_eq(sht3x.read_status(b2, 0x44), -1)
+
+    test.case("a command that is not acknowledged is never followed by a read")
+    let b3 = fresh_bus()
+    bus_raw = 0x0010c20000000000
+    bus_fail_at = 1
+    test.assert_eq(sht3x.read_status(b3, 0x44), -1)
+    test.assert_eq(list.len(logged()), 1)
+
+    test.case("a read that fails is a status that was not read")
+    let b4 = fresh_bus()
+    bus_raw = 0x0010c20000000000
+    bus_fail_at = 2
+    test.assert_eq(sht3x.read_status(b4, 0x44), -1)
+
+    test.case("a status word that is zero is a status, not a failure")
+    let b5 = fresh_bus()
+    bus_raw = 0x000081_0000000000
+    test.assert_eq(sht3x.read_status(b5, 0x44), 0)
+
+@test
+fn test_the_status_and_the_heater_are_commands_of_their_own() [io, mutate]
+    let b = fresh_bus()
+    test.case("clear, then the heater on and off")
+    test.assert(sht3x.clear_status(b, 0x44))
+    test.assert(sht3x.set_heater(b, 0x44, true))
+    test.assert(sht3x.set_heater(b, 0x44, false))
+    test.assert_eq(logged()[0], ev_write_raw(0x3041, 2))
+    test.assert_eq(logged()[1], ev_write_raw(0x306d, 2))
+    test.assert_eq(logged()[2], ev_write_raw(0x3066, 2))
+
+@test
+fn test_a_measurement_is_triggered_then_read_only_after_its_wait() [io, mutate]
+    test.case("the trigger is the repeatability's command and answers its wait")
+    let b = fresh_bus()
+    bus_raw = 0x6666938000a20000
+    let c = sht3x.start_measurement(b, 0x44, sht3x.SHT3X_REPEATABILITY_MEDIUM)
+    test.assert_eq(logged()[0], ev_write_raw(0x240b, 2))
+    test.assert_eq(c.micros, 6500)
+
+    test.case("a read before the wait is over makes no transaction and is not a reply")
+    test.assert(not sht3x.reply_ok(sht3x.read_reply(b, 0x44, c, 6499)))
+    test.assert_eq(list.len(logged()), 1)
+
+    test.case("a read after it is one six-byte read, checked")
+    let r = sht3x.read_reply(b, 0x44, c, 6500)
+    test.assert(sht3x.reply_ok(r))
+    test.assert_eq(r.raw_temp, 0x6666)
+    test.assert_eq(logged()[1], ev_read_raw(6))
+    test.assert_eq(list.len(logged()), 2)
+
+    test.case("a trigger that is not acknowledged is a conversion that never started, and refuses the read")
+    let b2 = fresh_bus()
+    bus_raw = 0x6666938000a20000
+    bus_fail_at = 1
+    let none = sht3x.start_measurement(b2, 0x44, sht3x.SHT3X_REPEATABILITY_HIGH)
+    test.assert(not i2ctiming.is_started(none))
+    test.assert(not sht3x.reply_ok(sht3x.read_reply(b2, 0x44, none, 3600000000)))
+    test.assert_eq(list.len(logged()), 1)
+
+    test.case("a read that fails is a reply that is not ok, named as a data NAK")
+    let b3 = fresh_bus()
+    bus_fail_at = 1
+    let late = sht3x.read_reply(b3, 0x44, i2ctiming.conversion(0), 0)
+    test.assert(not late.ok)
+    test.assert_eq(sht3x.reply_status(late), i2cstatus.I2C_STATUS_DATA_NAK)
+
+// ── bh1750 ───────────────────────────────────────────────────────────
+
+@test
+fn test_each_mode_has_its_opcode_and_its_wait_and_none_other_is_a_mode() [io]
+    test.case("0x20, 0x21 and 0x23, and 180, 180 and 24 ms at the default measurement time")
+    test.assert_eq(bh1750.oneshot_command(0), 0x20)
+    test.assert_eq(bh1750.oneshot_command(1), 0x21)
+    test.assert_eq(bh1750.oneshot_command(2), 0x23)
+    test.assert_eq(bh1750.conversion_time(0).micros, 180000)
+    test.assert_eq(bh1750.conversion_time(1).micros, 180000)
+    test.assert_eq(bh1750.conversion_time(2).micros, 24000)
+
+    test.case("a value that is none of them is high resolution")
+    test.assert_eq(bh1750.oneshot_command(9), 0x20)
+    test.assert_eq(bh1750.conversion_time(9).micros, 180000)
+
+@test
+fn test_the_wait_scales_with_the_measurement_time_and_is_held_to_its_range() [io]
+    test.case("twice the register is twice the wait, and the ends of the range round up")
+    test.assert_eq(bh1750.conversion_time_at(0, 69).micros, 180000)
+    test.assert_eq(bh1750.conversion_time_at(0, 138).micros, 360000)
+    test.assert_eq(bh1750.conversion_time_at(0, 31).micros, 80870)
+    test.assert_eq(bh1750.conversion_time_at(2, 254).micros, 88348)
+    test.assert_eq(bh1750.conversion_time_at(2, 31).micros, 10783)
+
+    test.case("a register outside 31 to 254 is the nearest end of it")
+    test.assert_eq(bh1750.conversion_time_at(0, 0).micros, 80870)
+    test.assert_eq(bh1750.conversion_time_at(0, 1000).micros, 662609)
+    test.assert_eq(bh1750.conversion_time_at(0, -5).micros, 80870)
+
+@test
+fn test_the_measurement_time_is_two_bytes_split_three_and_five_and_held_in_range() [io]
+    test.case("the default, 69, is 0b010_00101")
+    test.assert_eq(bh1750.mt_high_byte(69), 0x42)
+    test.assert_eq(bh1750.mt_low_byte(69), 0x65)
+
+    test.case("the two ends of the range")
+    test.assert_eq(bh1750.mt_high_byte(31), 0x40)
+    test.assert_eq(bh1750.mt_low_byte(31), 0x7f)
+    test.assert_eq(bh1750.mt_high_byte(254), 0x47)
+    test.assert_eq(bh1750.mt_low_byte(254), 0x7e)
+
+    test.case("a value outside the range is sent as the nearest end, never as a different field")
+    test.assert_eq(bh1750.mt_high_byte(0), 0x40)
+    test.assert_eq(bh1750.mt_low_byte(0), 0x7f)
+    test.assert_eq(bh1750.mt_high_byte(1000), 0x47)
+    test.assert_eq(bh1750.mt_low_byte(1000), 0x7e)
+
+    test.case("valid is 31 to 254 and one either side is not")
+    test.assert(not bh1750.mt_is_valid(30))
+    test.assert(bh1750.mt_is_valid(31))
+    test.assert(bh1750.mt_is_valid(254))
+    test.assert(not bh1750.mt_is_valid(255))
+
+@test
+fn test_the_count_becomes_thousandths_of_a_lux_by_the_mode_and_the_register() [io]
+    test.case("1200 counts at the defaults is 1000 lux, half that in the second high-resolution mode")
+    test.assert_eq(bh1750.milli_lux_of(1200, 0, 69), 1000000)
+    test.assert_eq(bh1750.milli_lux_of(1200, 2, 69), 1000000)
+    test.assert_eq(bh1750.milli_lux_of(1200, 1, 69), 500000)
+
+    test.case("the same count at twice the integration is half the light")
+    test.assert_eq(bh1750.milli_lux_of(1200, 0, 138), 500000)
+
+    test.case("the largest count that is not the ceiling, and one count at the longest integration")
+    test.assert_eq(bh1750.milli_lux_of(65534, 0, 69), 54611667)
+    test.assert_eq(bh1750.milli_lux_of(1, 0, 254), 226)
+
+    test.case("a register outside the range is held to it, so nothing divides by zero")
+    test.assert_eq(bh1750.milli_lux_of(1200, 0, 0), 2225806)
+    test.assert_eq(bh1750.milli_lux_of(1200, 0, 1000), 271654)
+
+    test.case("the ceilings the three settings reach")
+    test.assert_eq(bh1750.ceiling_milli_lux(0, 69), 54612500)
+    test.assert_eq(bh1750.ceiling_milli_lux(0, 31), 121556855)
+    test.assert_eq(bh1750.ceiling_milli_lux(1, 69), 27306250)
+    test.assert(bh1750.ceiling_milli_lux(0, 31) <= i2csample.quantity_max(i2csample.I2C_Q_ILLUMINANCE))
+
+    test.case("one count under the ceiling is not saturated")
+    test.assert(not bh1750.is_saturated(65534))
+    test.assert(bh1750.is_saturated(65535))
+
+@test
+fn test_a_reading_is_a_measurement_a_saturation_or_a_transfer_that_failed() [io]
+    test.case("a count that is neither is a measurement, and its sample is valid")
+    let r = bh1750.reading_of(i2cbus.word(1200, 2), 0, 69)
+    test.assert(r.valid)
+    test.assert(not r.saturated)
+    test.assert_eq(r.milli_lux, 1000000)
+    test.assert_eq(bh1750.reading_status(r), i2cstatus.I2C_STATUS_OK)
+    test.assert_eq(bh1750.illuminance(r).value, 1000000)
+    test.assert(bh1750.illuminance(r).valid)
+    test.assert_eq(bh1750.illuminance(r).quantity, i2csample.I2C_Q_ILLUMINANCE)
+
+    test.case("the ceiling is saturated, with no illuminance claimed")
+    let s = bh1750.reading_of(i2cbus.word(0xffff, 2), 0, 69)
+    test.assert(s.saturated and not s.valid)
+    test.assert_eq(s.milli_lux, 0)
+    test.assert_eq(bh1750.reading_status(s), i2cstatus.I2C_STATUS_SATURATED)
+    test.assert(not bh1750.illuminance(s).valid)
+
+    test.case("a failed transfer, and one byte where two were asked, are neither measured nor saturated")
+    let d = bh1750.reading_of(i2cbus.word_failed(), 0, 69)
+    test.assert(not d.valid and not d.saturated)
+    test.assert_eq(bh1750.reading_status(d), i2cstatus.I2C_STATUS_ADDRESS_NAK)
+    let one = bh1750.reading_of(i2cbus.word(0x12, 1), 0, 69)
+    test.assert(not one.valid)
+    test.assert_eq(one.milli_lux, 0)
+    test.assert_eq(bh1750.illuminance(d).value, 0)
+
+@test
+fn test_a_reset_powers_on_before_it_resets_and_stops_when_the_first_fails() [io, mutate]
+    let b = fresh_bus()
+    test.case("power on, then reset, each one byte")
+    test.assert(bh1750.reset(b, 0x23))
+    test.assert_eq(logged()[0], ev_write_raw(0x01, 1))
+    test.assert_eq(logged()[1], ev_write_raw(0x07, 1))
+
+    test.case("a power-on that is not acknowledged ends it")
+    let b2 = fresh_bus()
+    bus_fail_at = 1
+    test.assert(not bh1750.reset(b2, 0x23))
+    test.assert_eq(list.len(logged()), 1)
+
+    test.case("a reset that is not acknowledged is reported")
+    let b3 = fresh_bus()
+    bus_fail_at = 2
+    test.assert(not bh1750.reset(b3, 0x23))
+
+@test
+fn test_the_measurement_time_is_set_with_the_part_powered_and_in_two_one_byte_writes() [io, mutate]
+    let b = fresh_bus()
+    test.case("power on, then the high byte, then the low byte")
+    test.assert(bh1750.set_measurement_time(b, 0x23, 69))
+    test.assert_eq(list.len(logged()), 3)
+    test.assert_eq(logged()[0], ev_write_raw(0x01, 1))
+    test.assert_eq(logged()[1], ev_write_raw(0x42, 1))
+    test.assert_eq(logged()[2], ev_write_raw(0x65, 1))
+
+    test.case("a value outside 31 to 254 sends nothing")
+    let b2 = fresh_bus()
+    test.assert(not bh1750.set_measurement_time(b2, 0x23, 30))
+    test.assert(not bh1750.set_measurement_time(b2, 0x23, 255))
+    test.assert_eq(list.len(logged()), 0)
+
+    test.case("a write that is not acknowledged stops the sequence there")
+    for step in 1..4
+        let b3 = fresh_bus()
+        bus_fail_at = step
+        test.assert(not bh1750.set_measurement_time(b3, 0x23, 69))
+        test.assert_eq(list.len(logged()), step)
+
+@test
+fn test_a_measurement_powers_on_sets_its_time_and_triggers_every_time() [io, mutate]
+    test.case("four one-byte writes, and the wait is the mode's at that register")
+    let b = fresh_bus()
+    bus_raw = 0x04b0000000000000
+    let c = bh1750.start_measurement(b, 0x23, 0, 69)
+    test.assert_eq(list.len(logged()), 4)
+    test.assert_eq(logged()[0], ev_write_raw(0x01, 1))
+    test.assert_eq(logged()[1], ev_write_raw(0x42, 1))
+    test.assert_eq(logged()[2], ev_write_raw(0x65, 1))
+    test.assert_eq(logged()[3], ev_write_raw(0x20, 1))
+    test.assert_eq(c.micros, 180000)
+
+    test.case("low resolution at the shortest integration uses its own opcode and wait")
+    let b2 = fresh_bus()
+    let low = bh1750.start_measurement(b2, 0x23, 2, 31)
+    test.assert_eq(logged()[3], ev_write_raw(0x23, 1))
+    test.assert_eq(low.micros, 10783)
+
+    test.case("a write that is not acknowledged at any of the four is a measurement that never started")
+    for step in 1..5
+        let b3 = fresh_bus()
+        bus_fail_at = step
+        let none = bh1750.start_measurement(b3, 0x23, 0, 69)
+        test.assert(not i2ctiming.is_started(none))
+        test.assert_eq(list.len(logged()), step)
+
+    test.case("a register value outside the range starts nothing and sends nothing")
+    let b4 = fresh_bus()
+    test.assert(not i2ctiming.is_started(bh1750.start_measurement(b4, 0x23, 0, 300)))
+    test.assert_eq(list.len(logged()), 0)
+
+    test.case("a read before the wait is over makes no transaction, and after it is one two-byte read")
+    let b5 = fresh_bus()
+    bus_raw = 0x04b0000000000000
+    let c5 = bh1750.start_measurement(b5, 0x23, 0, 69)
+    test.assert(not bh1750.read_reading(b5, 0x23, 0, 69, c5, 179999).valid)
+    test.assert_eq(list.len(logged()), 4)
+    let r = bh1750.read_reading(b5, 0x23, 0, 69, c5, 180000)
+    test.assert(r.valid)
+    test.assert_eq(r.milli_lux, 1000000)
+    test.assert_eq(logged()[4], ev_read_raw(2))
+
+    test.case("a conversion that never started refuses the read however long the wait, and a failed read is not valid")
+    test.assert(not bh1750.read_reading(b5, 0x23, 0, 69, i2ctiming.not_started(), 3600000000).valid)
+    test.assert_eq(list.len(logged()), 5)
+    bus_fail_at = bus_count + 1
+    test.assert(not bh1750.read_reading(b5, 0x23, 0, 69, c5, 180000).valid)
+
+@test
+fn test_a_part_can_be_powered_down_and_sent_an_opcode_by_hand() [io, mutate]
+    let b = fresh_bus()
+    test.assert(bh1750.power_down(b, 0x23))
+    test.assert_eq(logged()[0], ev_write_raw(0x00, 1))
+    test.assert(bh1750.command(b, 0x23, 0x10))
+    test.assert_eq(logged()[1], ev_write_raw(0x10, 1))
+    bus_fail_at = bus_count + 1
+    test.assert(not bh1750.power_down(b, 0x23))
+
+// ── ina219 ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_configuration_register_word_has_each_field_in_its_place() [io]
+    test.case("the part's own power-on word, 0x399f")
+    test.assert_eq(ina219.config_word(ina219.default_config()), 0x399f)
+
+    test.case("a configuration with every field different")
+    let c = ina219.config(0, 1, 3, 15, 3)
+    test.assert_eq(ina219.config_word(c), 0x09fb)
+
+    test.case("every field survives a round trip through the word, over its whole range")
+    for gain in 0..4
+        for mode in 0..8
+            let c2 = ina219.config(gain & 1, gain, mode + 8, 15 - mode, mode)
+            let back = ina219.config_from_word(ina219.config_word(c2))
+            test.assert_eq(back.bus_range, c2.bus_range)
+            test.assert_eq(back.gain, c2.gain)
+            test.assert_eq(back.bus_adc, c2.bus_adc)
+            test.assert_eq(back.shunt_adc, c2.shunt_adc)
+            test.assert_eq(back.mode, c2.mode)
+
+    test.case("a field that is too wide does not spill into its neighbour")
+    test.assert_eq(ina219.config_word(ina219.config(3, 7, 31, 31, 15)), 0x3fff)
+
+@test
+fn test_every_adc_setting_has_the_conversion_time_the_datasheet_prints() [io]
+    test.case("the sixteen settings, measured as the time of a bus-only conversion")
+    let times = [84, 148, 276, 532, 84, 148, 276, 532, 532, 1060, 2130, 4260, 8510, 17020, 34050, 68100]
+    for s in 0..16
+        let c = ina219.config(0, 3, s, 0, ina219.INA219_MODE_BUS_TRIGGERED)
+        test.assert_eq(ina219.conversion_time(c).micros, times[s])
+
+    test.case("and a setting above the fourth bit is read as its low four bits")
+    let wide = ina219.config(0, 3, 16 + 9, 0, ina219.INA219_MODE_BUS_TRIGGERED)
+    test.assert_eq(ina219.conversion_time(wide).micros, 1060)
+
+@test
+fn test_the_conversion_time_counts_the_channels_the_mode_converts() [io]
+    let c = ina219.config(0, 3, 9, 15, 0)
+
+    test.case("the shunt alone, the bus alone, and both, in the triggered and the continuous modes")
+    let shunt = [ina219.INA219_MODE_SHUNT_TRIGGERED, ina219.INA219_MODE_SHUNT_CONTINUOUS]
+    let bus = [ina219.INA219_MODE_BUS_TRIGGERED, ina219.INA219_MODE_BUS_CONTINUOUS]
+    let both = [ina219.INA219_MODE_BOTH_TRIGGERED, ina219.INA219_MODE_BOTH_CONTINUOUS]
+    for k in 0..2
+        test.assert_eq(ina219.conversion_time(ina219.config(0, 3, 9, 15, shunt[k])).micros, 68100)
+        test.assert_eq(ina219.conversion_time(ina219.config(0, 3, 9, 15, bus[k])).micros, 1060)
+        test.assert_eq(ina219.conversion_time(ina219.config(0, 3, 9, 15, both[k])).micros, 69160)
+
+    test.case("a part that is powered down or has its ADC off converts nothing")
+    test.assert_eq(ina219.conversion_time(ina219.config(0, 3, 9, 15, ina219.INA219_MODE_POWER_DOWN)).micros, 0)
+    test.assert_eq(ina219.conversion_time(ina219.config(0, 3, 9, 15, ina219.INA219_MODE_ADC_OFF)).micros, 0)
+    test.assert_eq(c.mode, 0)
+
+    test.case("the power-on configuration is a little over a millisecond")
+    test.assert_eq(ina219.conversion_time(ina219.default_config()).micros, 1064)
+
+@test
+fn test_the_gain_ceiling_is_exact_and_the_smallest_gain_that_fits_is_found() [io]
+    test.case("the four full scales")
+    test.assert_eq(ina219.gain_full_scale_uv(0), 40000)
+    test.assert_eq(ina219.gain_full_scale_uv(1), 80000)
+    test.assert_eq(ina219.gain_full_scale_uv(2), 160000)
+    test.assert_eq(ina219.gain_full_scale_uv(3), 320000)
+
+    test.case("a current that reaches the ceiling exactly fits, and one microampere more does not")
+    test.assert(ina219.gain_fits(0, 100, 400000))
+    test.assert(not ina219.gain_fits(0, 100, 400001))
+    test.assert(ina219.gain_fits(3, 100, 3200000))
+    test.assert(not ina219.gain_fits(3, 100, 3200001))
+
+    test.case("the smallest gain that fits, for each of the four, and none when none can")
+    test.assert_eq(ina219.gain_for(100, 400000), 0)
+    test.assert_eq(ina219.gain_for(100, 800000), 1)
+    test.assert_eq(ina219.gain_for(100, 1600000), 2)
+    test.assert_eq(ina219.gain_for(100, 3200000), 3)
+    test.assert_eq(ina219.gain_for(100, 3200001), -1)
+
+    test.case("a shunt or a current that is not positive, or past the limit, fits no gain")
+    test.assert(not ina219.gain_fits(3, 0, 1000))
+    test.assert(not ina219.gain_fits(3, 100, 0))
+    test.assert(not ina219.gain_fits(3, -1, 1000))
+    test.assert(not ina219.gain_fits(3, 1000000001, 1000))
+    test.assert(not ina219.gain_fits(3, 100, 1000000001))
+
+@test
+fn test_a_calibration_has_an_lsb_the_register_can_hold_and_says_what_it_assumed() [io]
+    test.case("the datasheet's formula in microamperes and milliohms, 0.1 ohm and 3.2 A")
+    let a = ina219.calibration(100, 3200000)
+    test.assert(a.ok)
+    test.assert_eq(a.reg, 4192)
+    test.assert_eq(a.current_lsb_na, 97700)
+    test.assert_eq(a.power_lsb_uw, 1954)
+    test.assert_eq(a.shunt_milliohm, 100)
+
+    test.case("the register value is even, because bit 0 of the register is void")
+    for k in 0..6
+        let shunt = [100, 1000, 10, 100, 500, 100][k]
+        let amps = [3200000, 1000, 10000000, 400000, 1000000, 1][k]
+        let c = ina219.calibration(shunt, amps)
+        test.assert(c.ok)
+        test.assert_eq(c.reg & 1, 0)
+        test.assert_eq(c.current_lsb_na % 50, 0)
+        test.assert_eq(c.power_lsb_uw * 50, c.current_lsb_na)
+
+    test.case("the reference values for five more shunts and currents")
+    let b = ina219.calibration(1000, 1000)
+    test.assert_eq(b.reg, 63014)
+    test.assert_eq(b.current_lsb_na, 650)
+    let c = ina219.calibration(10, 10000000)
+    test.assert_eq(c.reg, 13420)
+    test.assert_eq(c.current_lsb_na, 305200)
+    let d = ina219.calibration(100, 400000)
+    test.assert_eq(d.reg, 33436)
+    test.assert_eq(d.current_lsb_na, 12250)
+    let e = ina219.calibration(100, 1)
+    test.assert_eq(e.reg, 65014)
+    test.assert_eq(e.current_lsb_na, 6300)
+
+    test.case("an LSB raised until the divisor fits the register still reaches the promised current")
+    test.assert(b.current_lsb_na * 32768 >= 1000 * 1000)
+    test.assert(b.reg <= 65534)
+
+    test.case("a shunt or a current that is not positive or is past the limit is no calibration")
+    test.assert(not ina219.calibration(0, 1000).ok)
+    test.assert(not ina219.calibration(100, 0).ok)
+    test.assert(not ina219.calibration(-5, 1000).ok)
+    test.assert(not ina219.calibration(1000000001, 1000).ok)
+    test.assert(not ina219.calibration(100, 1000000001).ok)
+
+    test.case("and so is one whose divisor would be below two, which the register cannot represent")
+    test.assert(not ina219.calibration(1000000000, 1000000000).ok)
+    test.assert_eq(ina219.calibration(1000000000, 1000000000).reg, 0)
+
+    test.case("no calibration is zero throughout")
+    let none = ina219.no_calibration()
+    test.assert(not none.ok)
+    test.assert_eq(none.reg, 0)
+    test.assert_eq(none.current_lsb_na, 0)
+    test.assert_eq(none.power_lsb_uw, 0)
+    test.assert_eq(none.shunt_milliohm, 0)
+
+@test
+fn test_the_registers_become_microvolts_microamperes_and_microwatts_with_their_signs() [io]
+    let cal = ina219.calibration(100, 3200000)
+
+    test.case("the shunt voltage is signed at ten microvolts a count, from a count or from the register word")
+    test.assert_eq(ina219.shunt_uv_of(1000), 10000)
+    test.assert_eq(ina219.shunt_uv_of(-1000), -10000)
+    test.assert_eq(ina219.shunt_uv_of(0xfc18), -10000)
+    test.assert_eq(ina219.shunt_uv_of(0x7fff), 327670)
+    test.assert_eq(ina219.shunt_uv_of(0x8000), -327680)
+
+    test.case("the bus voltage is thirteen bits at four millivolts, whatever the flag bits hold")
+    test.assert_eq(ina219.bus_uv_of(0x19d8), 3308000)
+    test.assert_eq(ina219.bus_uv_of(0x19df), 3308000)
+    test.assert_eq(ina219.bus_uv_of(0xfff8), 32764000)
+    test.assert_eq(ina219.bus_uv_of(0x0007), 0)
+
+    test.case("the two flags are bit 1 and bit 0 and nothing else")
+    test.assert(ina219.bus_conversion_ready(0x0002))
+    test.assert(not ina219.bus_conversion_ready(0xfffd))
+    test.assert(ina219.bus_overflow(0x0001))
+    test.assert(not ina219.bus_overflow(0xfffe))
+
+    test.case("the current is the signed count times the LSB, truncated toward zero to a microampere")
+    test.assert_eq(ina219.current_ua_of(1000, cal), 97700)
+    test.assert_eq(ina219.current_ua_of(-1000, cal), -97700)
+    test.assert_eq(ina219.current_ua_of(0xfc18, cal), -97700)
+    test.assert_eq(ina219.current_ua_of(1, ina219.calibration(100, 1)), 6)
+    test.assert_eq(ina219.current_ua_of(-1, ina219.calibration(100, 1)), -6)
+
+    test.case("the power is the unsigned count times the power LSB")
+    test.assert_eq(ina219.power_uw_of(100, cal), 195400)
+    test.assert_eq(ina219.power_uw_of(0xffff, cal), 65535 * 1954)
+
+    test.case("without a calibration both are zero")
+    test.assert_eq(ina219.current_ua_of(1000, ina219.no_calibration()), 0)
+    test.assert_eq(ina219.power_uw_of(1000, ina219.no_calibration()), 0)
+
+@test
+fn test_a_reading_carries_its_flags_and_names_the_first_problem_in_the_documented_order() [io]
+    let cal = ina219.calibration(100, 3200000)
+
+    test.case("a calibrated reading of a finished conversion is ok, and every field is its register's")
+    let r = ina219.reading_of(1000, 0x19da, 1000, 100, cal)
+    test.assert_eq(r.shunt_uv, 10000)
+    test.assert_eq(r.bus_uv, 3308000)
+    test.assert_eq(r.current_ua, 97700)
+    test.assert_eq(r.power_uw, 195400)
+    test.assert(r.ready and r.calibrated and not r.overflow)
+    test.assert_eq(ina219.reading_status(r), i2cstatus.I2C_STATUS_OK)
+    test.assert_eq(ina219.voltage(r).value, 3308000)
+    test.assert_eq(ina219.current(r).value, 97700)
+    test.assert_eq(ina219.power(r).value, 195400)
+    test.assert(ina219.voltage(r).valid and ina219.current(r).valid and ina219.power(r).valid)
+
+    test.case("a conversion that was not finished is not ready")
+    let early = ina219.reading_of(1000, 0x19d8, 1000, 100, cal)
+    test.assert(not early.ready)
+    test.assert_eq(ina219.reading_status(early), i2cstatus.I2C_STATUS_NOT_READY)
+
+    test.case("an overflow is saturated, whatever else is wrong, and withdraws the current and the power")
+    let over = ina219.reading_of(1000, 0x19db, 1000, 100, cal)
+    test.assert(over.overflow)
+    test.assert_eq(ina219.reading_status(over), i2cstatus.I2C_STATUS_SATURATED)
+    test.assert(not ina219.current(over).valid)
+    test.assert(not ina219.power(over).valid)
+    test.assert(ina219.voltage(over).valid)
+    let over_uncal = ina219.reading_of(1000, 0x19d9, 1000, 100, ina219.no_calibration())
+    test.assert_eq(ina219.reading_status(over_uncal), i2cstatus.I2C_STATUS_SATURATED)
+
+    test.case("no calibration is named before a conversion that is not finished, because waiting does not repair it")
+    let both = ina219.reading_of(1000, 0x19d8, 0, 0, ina219.no_calibration())
+    test.assert(not both.ready)
+    test.assert_eq(ina219.reading_status(both), i2cstatus.I2C_STATUS_UNCALIBRATED)
+
+    test.case("a current outside any range a sample can hold is a reading but not a sample")
+    let huge = I2cInaReading { shunt_uv: 0, bus_uv: 0, current_ua: 2147483648, power_uw: 2147483648,
+                               ready: true, overflow: false, calibrated: true }
+    test.assert(not ina219.current(huge).valid)
+    test.assert(not ina219.power(huge).valid)
+
+@test
+fn test_the_power_without_a_calibration_is_the_voltage_times_the_current_through_the_shunt() [io]
+    test.case("0.828 V on the bus and 10 mV across 0.1 ohm is 100 mA, which is 82.8 mW")
+    let r = ina219.reading_of(1000, 0x0678, 0, 0, ina219.no_calibration())
+    test.assert_eq(ina219.implied_power_uw(r, 100), 82800)
+
+    test.case("a reverse current is a negative power")
+    let rev = ina219.reading_of(-1000, 0x0678, 0, 0, ina219.no_calibration())
+    test.assert_eq(ina219.implied_power_uw(rev, 100), -82800)
+
+    test.case("a shunt of zero or less implies nothing")
+    test.assert_eq(ina219.implied_power_uw(r, 0), 0)
+    test.assert_eq(ina219.implied_power_uw(r, -5), 0)
+
+@test
+fn test_the_registers_are_written_as_three_bytes_and_the_reset_bit_is_bit_15() [io, mutate]
+    let b = fresh_bus()
+    let cal = ina219.calibration(100, 3200000)
+
+    test.case("reset is 0x8000 to register 0, configure the word, calibrate the register value")
+    test.assert(ina219.reset(b, 0x40))
+    test.assert(ina219.configure(b, 0x40, ina219.default_config()))
+    test.assert(ina219.write_calibration(b, 0x40, cal))
+    test.assert_eq(logged()[0], ev_write_raw(0x008000, 3))
+    test.assert_eq(logged()[1], ev_write_raw(0x00399f, 3))
+    test.assert_eq(logged()[2], ev_write_raw(0x051060, 3))
+
+    test.case("a calibration that was not computed is not written")
+    test.assert(not ina219.write_calibration(b, 0x40, ina219.no_calibration()))
+    test.assert_eq(list.len(logged()), 3)
+
+    test.case("a write that is not acknowledged is reported")
+    bus_fail_at = bus_count + 1
+    test.assert(not ina219.reset(b, 0x40))
+    bus_fail_at = bus_count + 1
+    test.assert(not ina219.configure(b, 0x40, ina219.default_config()))
+    bus_fail_at = bus_count + 1
+    test.assert(not ina219.write_calibration(b, 0x40, cal))
+
+@test
+fn test_the_calibration_register_is_calibrated_when_it_holds_something_and_was_read() [io, mutate]
+    let b = fresh_bus()
+    test.case("a register that holds a value, one that holds zero, and one that was not read")
+    load16(0x05, 0x1060)
+    test.assert(ina219.is_calibrated(b, 0x40))
+    test.assert_eq(logged()[0], ev_read_reg(0x05, 2))
+    load16(0x05, 0x0000)
+    test.assert(not ina219.is_calibrated(b, 0x40))
+    load16(0x05, 0x1060)
+    bus_fail_at = bus_count + 1
+    test.assert(not ina219.is_calibrated(b, 0x40))
+
+    test.case("a value in the low byte only still counts")
+    load16(0x05, 0x0002)
+    test.assert(ina219.is_calibrated(b, 0x40))
+
+@test
+fn test_a_triggered_mode_is_started_by_writing_the_configuration_and_a_continuous_one_is_not() [io, mutate]
+    test.case("a triggered mode writes the configuration and answers its wait")
+    let b = fresh_bus()
+    let trig = ina219.config(0, 3, 3, 3, ina219.INA219_MODE_BOTH_TRIGGERED)
+    let c = ina219.start_measurement(b, 0x40, trig)
+    test.assert_eq(list.len(logged()), 1)
+    test.assert_eq(logged()[0], ev_write_raw(0x00199b, 3))
+    test.assert_eq(c.micros, 1064)
+
+    test.case("the shunt-only and the bus-only triggered modes write it too")
+    let b2 = fresh_bus()
+    ina219.start_measurement(b2, 0x40, ina219.config(0, 3, 3, 3, ina219.INA219_MODE_SHUNT_TRIGGERED))
+    ina219.start_measurement(b2, 0x40, ina219.config(0, 3, 3, 3, ina219.INA219_MODE_BUS_TRIGGERED))
+    test.assert_eq(list.len(logged()), 2)
+
+    test.case("a continuous mode writes nothing and answers its wait")
+    let b3 = fresh_bus()
+    let cont = ina219.start_measurement(b3, 0x40, ina219.default_config())
+    test.assert_eq(list.len(logged()), 0)
+    test.assert_eq(cont.micros, 1064)
+
+    test.case("a mode that converts nothing writes nothing and waits for nothing")
+    let b4 = fresh_bus()
+    let off = ina219.start_measurement(b4, 0x40, ina219.config(0, 3, 3, 3, ina219.INA219_MODE_POWER_DOWN))
+    test.assert_eq(list.len(logged()), 0)
+    test.assert_eq(off.micros, 0)
+
+    test.case("a configuration write that is not acknowledged is a conversion that never started")
+    let b5 = fresh_bus()
+    bus_fail_at = 1
+    test.assert(not i2ctiming.is_started(ina219.start_measurement(b5, 0x40, trig)))
+
+@test
+fn test_the_four_registers_are_read_with_power_last_and_only_after_the_wait() [io, mutate]
+    let b = fresh_bus()
+    let cal = ina219.calibration(100, 3200000)
+    load16(0x01, 0x03e8)
+    load16(0x02, 0x19da)
+    load16(0x04, 0x03e8)
+    load16(0x03, 0x0064)
+    let c = ina219.start_measurement(b, 0x40, ina219.default_config())
+
+    test.case("a read before the wait is over makes no transaction and has nothing in it")
+    let early = ina219.read_reading(b, 0x40, cal, c, c.micros - 1)
+    test.assert(not early.ready)
+    test.assert_eq(early.shunt_uv, 0)
+    test.assert(early.calibrated)
+    test.assert_eq(list.len(logged()), 0)
+
+    test.case("after it, shunt, bus, current and power in that order, two bytes each")
+    let r = ina219.read_reading(b, 0x40, cal, c, c.micros)
+    test.assert_eq(list.len(logged()), 4)
+    test.assert_eq(logged()[0], ev_read_reg(0x01, 2))
+    test.assert_eq(logged()[1], ev_read_reg(0x02, 2))
+    test.assert_eq(logged()[2], ev_read_reg(0x04, 2))
+    test.assert_eq(logged()[3], ev_read_reg(0x03, 2))
+    test.assert_eq(r.shunt_uv, 10000)
+    test.assert_eq(r.bus_uv, 3308000)
+    test.assert_eq(r.current_ua, 97700)
+    test.assert_eq(r.power_uw, 195400)
+    test.assert(r.ready and r.calibrated)
+
+    test.case("a transfer that fails at any of the four is a reading with nothing in it")
+    for step in 1..5
+        let b2 = fresh_bus()
+        load16(0x02, 0x19da)
+        bus_fail_at = step
+        let bad = ina219.read_reading(b2, 0x40, cal, c, c.micros)
+        test.assert(not bad.ready)
+        test.assert_eq(bad.bus_uv, 0)
+        test.assert_eq(list.len(logged()), step)
+
+    test.case("a conversion that never started refuses the read, and carries the calibration's state")
+    let never = ina219.read_reading(b, 0x40, ina219.no_calibration(), i2ctiming.not_started(), 3600000000)
+    test.assert(not never.calibrated)
+    test.assert(not never.ready)
+
+@test
+fn test_the_two_voltages_can_be_read_without_a_calibration() [io, mutate]
+    let b = fresh_bus()
+    load16(0x01, 0xfc18)
+    load16(0x02, 0x19da)
+
+    test.case("two reads, the shunt then the bus, and a reading that is never calibrated")
+    let r = ina219.read_voltages(b, 0x40)
+    test.assert_eq(list.len(logged()), 2)
+    test.assert_eq(logged()[0], ev_read_reg(0x01, 2))
+    test.assert_eq(logged()[1], ev_read_reg(0x02, 2))
+    test.assert_eq(r.shunt_uv, -10000)
+    test.assert_eq(r.bus_uv, 3308000)
+    test.assert(r.ready)
+    test.assert(not r.calibrated)
+    test.assert_eq(r.current_ua, 0)
+    test.assert_eq(r.power_uw, 0)
+
+    test.case("a transfer that fails at either is a reading with nothing in it")
+    for step in 1..3
+        let b2 = fresh_bus()
+        bus_fail_at = step
+        let bad = ina219.read_voltages(b2, 0x40)
+        test.assert(not bad.ready)
+        test.assert_eq(bad.bus_uv, 0)
+        test.assert_eq(list.len(logged()), step)
+
+// ── bme280: a calibration that was corrupted ─────────────────────────
+
+// A pressure calibration from its nine coefficients, as the struct.
+fn press_cal(p1: Int, p2: Int, p3: Int, p4: Int, p5: Int, p6: Int, p7: Int, p8: Int,
+             p9: Int) -> I2cBmePressCal
+    I2cBmePressCal { p1: p1, p2: p2, p3: p3, p4: p4, p5: p5, p6: p6, p7: p7, p8: p8, p9: p9 }
+
+// A compensated temperature carrying `t_fine`.
+fn at_t_fine(t_fine: Int) -> I2cBmeReading
+    I2cBmeReading { milli_c: 0, pascals: 0, milli_rh: 0, t_fine: t_fine,
+                    temp_valid: true, press_valid: false, hum_valid: false }
+
+@test
+fn test_a_pressure_calibration_that_would_overflow_is_refused_and_does_not_panic() [io]
+    // Each case reaches a different check in the routine, with
+    // coefficients no part holds and a corrupted read could.
+
+    test.case("the term the divisor is built from is too large to multiply by dig_P1")
+    let big_m = press_cal(65535, 0, 32767, 0, 0, 0, 0, 0, 0)
+    test.assert(not bme280.compensate_pressure(at_t_fine(4194304), big_m, 415148).press_valid)
+
+    test.case("the numerator is too large to scale")
+    let big_num = press_cal(1, 0, 0, 0, 0, 32767, 0, 0, 0)
+    test.assert(not bme280.compensate_pressure(at_t_fine(4194304), big_num, 415148).press_valid)
+
+    test.case("the quotient is far outside any pressure")
+    let flat = press_cal(1, 0, 0, 0, 0, 0, 0, 0, 0)
+    test.assert(not bme280.compensate_pressure(at_t_fine(128000), flat, 0).press_valid)
+
+    test.case("the result is below zero")
+    let low = press_cal(65535, 0, 0, 0, 0, 0, -32768, 0, 0)
+    test.assert(not bme280.compensate_pressure(at_t_fine(128000), low, 1048575).press_valid)
+
+    test.case("the same coefficients with a dig_P7 that is not negative do give a number")
+    let ok = press_cal(65535, 0, 0, 0, 0, 0, 0, 0, 0)
+    test.assert(bme280.compensate_pressure(at_t_fine(128000), ok, 1048575).press_valid)
+
+    test.case("a t_fine outside what the temperature routine can produce, and a raw value that is not twenty bits")
+    let sane = press_cal(36477, -10685, 3024, 2855, 140, -7, 15500, -14600, 6000)
+    test.assert(bme280.compensate_pressure(at_t_fine(128422), sane, 415148).press_valid)
+    test.assert(not bme280.compensate_pressure(at_t_fine(8388609), sane, 415148).press_valid)
+    test.assert(not bme280.compensate_pressure(at_t_fine(-8388609), sane, 415148).press_valid)
+    // A t_fine of 4e7 would overflow the second-order term before
+    // any later check could see it.
+    test.assert(not bme280.compensate_pressure(at_t_fine(40000000), big_num, 415148).press_valid)
+    test.assert(not bme280.compensate_pressure(at_t_fine(-40000000), big_num, 415148).press_valid)
+    test.assert(not bme280.compensate_pressure(at_t_fine(128422), sane, 1048576).press_valid)
+    test.assert(not bme280.compensate_pressure(at_t_fine(128422), sane, -1).press_valid)
+
+    test.case("a dig_P1 that is not positive is a divisor that cannot be used")
+    test.assert(not bme280.compensate_pressure(at_t_fine(128422), press_cal(-1, 0, 0, 0, 0, 0, 0, 0, 0), 415148).press_valid)
+
+@test
+fn test_a_humidity_calibration_that_would_overflow_is_refused_and_does_not_panic() [io]
+    let wild = I2cBmeHumCal { h1: 255, h2: 32767, h3: 255, h4: 0, h5: 2047, h6: 127 }
+    let sane = I2cBmeHumCal { h1: 75, h2: 366, h3: 0, h4: 310, h5: 50, h6: 30 }
+
+    test.case("a product beyond 2^46 is refused, with no humidity")
+    let r = bme280.compensate_humidity(at_t_fine(8000000), wild, 65000)
+    test.assert(not r.hum_valid)
+    test.assert_eq(r.milli_rh, 0)
+    test.assert(r.temp_valid)
+
+    test.case("a sane calibration at the same temperature is not")
+    test.assert(bme280.compensate_humidity(at_t_fine(128422), sane, 30000).hum_valid)
+
+    test.case("a t_fine out of range and a raw value that is not sixteen bits are refused")
+    test.assert(not bme280.compensate_humidity(at_t_fine(8388609), sane, 30000).hum_valid)
+    test.assert(not bme280.compensate_humidity(at_t_fine(-8388609), sane, 30000).hum_valid)
+    test.assert(not bme280.compensate_humidity(at_t_fine(128422), sane, 65536).hum_valid)
+    test.assert(not bme280.compensate_humidity(at_t_fine(128422), sane, -1).hum_valid)
+
+@test
+fn test_a_raw_temperature_that_is_not_twenty_bits_is_not_compensated() [io]
+    let tcal = bme280.temp_cal_from(i2cbus.word(0x706b436718fc, 6))
+
+    test.case("the largest twenty-bit value is compensated, and the next one and a negative one are not")
+    test.assert(bme280.compensate_temperature(tcal, 1048575).temp_valid)
+    test.assert(not bme280.compensate_temperature(tcal, 1048576).temp_valid)
+    test.assert(not bme280.compensate_temperature(tcal, -1).temp_valid)
+    test.assert(bme280.compensate_temperature(tcal, 0).temp_valid)
+
+    test.case("the extreme coefficients and the extreme raw values stay inside what the pressure routine accepts")
+    let wild = bme280.temp_cal_from(i2cbus.word(0xffff7fff7fff, 6))
+    test.assert(wild.t1 == 65535)
+    for raw in [0, 1048575, 524289]
+        let t = bme280.compensate_temperature(wild, raw)
+        test.assert(t.t_fine <= 8388608 and t.t_fine >= -8388608)

@@ -1,0 +1,105 @@
+// i2c_board_tests.nv — the board's bus as the bus the drivers are written
+// over: the two conversions between a byte list and a word, and the
+// answers of a bus with nothing on it.
+//
+// THE HOST HAS NO I2C BUS, AND ITS HOOK SAYS SO: a write is not
+// acknowledged and a read answers no bytes.  So the methods are checked
+// here against a bus on which nothing answers, which is the refusal path
+// every driver has to carry, and the conversions are checked directly
+// with the lists a board that did answer would hand back.
+
+use std.test
+use bme280
+use embedded_hal.{ I2cBus }
+use i2cbus
+use i2cboard
+use i2cstatus
+use ina219
+use sht3x
+
+@test
+fn test_a_reply_list_becomes_a_word_first_byte_highest() [io]
+    test.case("two bytes, and the eight a measurement block holds")
+    let two = i2cboard.word_of(Some([0x12 as u8, 0x34 as u8]), 2)
+    test.assert(two.ok)
+    test.assert_eq(two.count, 2)
+    test.assert_eq(two.bits, 0x1234)
+    let eight = i2cboard.word_of(Some([0x65 as u8, 0x5a as u8, 0xc0 as u8, 0x7e as u8,
+                                       0xed as u8, 0x00 as u8, 0x75 as u8, 0x30 as u8]),
+                                       8)
+    test.assert(eight.ok)
+    test.assert_eq(eight.bits, 0x655ac07eed007530)
+    test.assert_eq(i2cbus.be_u20_at(eight, 3), 519888)
+
+    test.case("a byte of 0xff stays 255 and does not sign-extend into the bytes above it")
+    let ff = i2cboard.word_of(Some([0xff as u8, 0x01 as u8]), 2)
+    test.assert_eq(ff.bits, 0xff01)
+
+    test.case("nothing acknowledged is the failed word")
+    test.assert(not i2cboard.word_of(None, 2).ok)
+    test.assert_eq(i2cboard.word_of(None, 2).count, 0)
+
+    test.case("a list that is not the asked length is a reply cut short")
+    test.assert(not i2cboard.word_of(Some([0x12 as u8]), 2).ok)
+    test.assert(not i2cboard.word_of(Some([0x12 as u8, 0x34 as u8, 0x56 as u8]), 2).ok)
+
+    test.case("and a size no word holds is refused whatever the list")
+    test.assert(not i2cboard.word_of(Some([0 as u8]), 0).ok)
+    test.assert(not i2cboard.word_of(Some([0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+                                           0 as u8, 0 as u8, 0 as u8]),
+                                           9).ok)
+    test.assert(i2cboard.word_of(Some([7 as u8]), 1).ok)
+
+@test
+fn test_an_integer_becomes_the_bytes_a_transfer_sends_most_significant_first() [io]
+    test.case("a Sensirion command is two bytes, an INA219 register write three")
+    let cmd = i2cboard.bytes_of(0x2400, 2)
+    test.assert_eq(list.len(cmd), 2)
+    test.assert_eq(cmd[0] as Int, 0x24)
+    test.assert_eq(cmd[1] as Int, 0x00)
+    let reg = i2cboard.bytes_of(0x051060, 3)
+    test.assert_eq(list.len(reg), 3)
+    test.assert_eq(reg[0] as Int, 0x05)
+    test.assert_eq(reg[1] as Int, 0x10)
+    test.assert_eq(reg[2] as Int, 0x60)
+
+    test.case("only the low bytes are sent")
+    let low = i2cboard.bytes_of(0xabcdef, 1)
+    test.assert_eq(list.len(low), 1)
+    test.assert_eq(low[0] as Int, 0xef)
+
+    test.case("no bytes is an empty list, and so is a negative count")
+    test.assert_eq(list.len(i2cboard.bytes_of(0x1234, 0)), 0)
+    test.assert_eq(list.len(i2cboard.bytes_of(0x1234, -4)), 0)
+
+    test.case("eight bytes reach the top one, and a count past eight is eight")
+    let eight = i2cboard.bytes_of(0x0102030405060708, 8)
+    test.assert_eq(list.len(eight), 8)
+    test.assert_eq(eight[0] as Int, 0x01)
+    test.assert_eq(eight[7] as Int, 0x08)
+    test.assert_eq(list.len(i2cboard.bytes_of(0x0102030405060708, 12)), 8)
+
+@test
+fn test_a_bus_with_nothing_on_it_refuses_every_transaction() [io, hw]
+    let b = i2cboard.open(0, 400000)
+
+    test.case("the handle is the board's bus 0 and the frequency is what was stated")
+    test.assert_eq(b.bus.id, 0)
+    test.assert_eq(b.i2c_frequency(), 400000)
+    test.assert_eq(i2cboard.open(1, 100000).bus.id, 1)
+    test.assert_eq(i2cboard.open(1, 100000).i2c_frequency(), 100000)
+
+    test.case("a write is not acknowledged and a read is the failed word")
+    test.assert(not b.i2c_write_reg(0x76, 0xf4, 0x25))
+    test.assert(not b.i2c_write_raw(0x44, 0x2400, 2))
+    test.assert(not b.i2c_read_reg(0x76, 0xd0, 1).ok)
+    test.assert(not b.i2c_read_raw(0x44, 6).ok)
+    test.assert(not b.i2c_present(0x76))
+
+    test.case("so a driver over it says nothing is there, and does not guess")
+    test.assert_eq(bme280.identify(b, 0x76), -1)
+    test.assert(not bme280.calibration_ok(bme280.read_calibration(b, 0x76)))
+    test.assert_eq(i2cbus.scan_next(b, 0x08), -1)
+    test.assert_eq(i2cbus.read_reg_checked(b, 0x76, 0xd0, 1), i2cstatus.I2C_STATUS_ADDRESS_NAK)
+    test.assert_eq(sht3x.read_status(b, 0x44), -1)
+    test.assert(not ina219.is_calibrated(b, 0x40))

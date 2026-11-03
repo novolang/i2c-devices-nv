@@ -1,8 +1,6 @@
 // sht3x.nv — Sensirion's SHT3x-DIS humidity and temperature sensor,
 // and the checksum every one of its replies carries.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // References are to the SHT3x-DIS datasheet, version 6.
 //
 // THIS PART HAS NO REGISTER MAP.  Everything is a sixteen-bit command
@@ -32,6 +30,11 @@
 // through a transaction it is in the middle of.  The commands here are
 // the non-stretching ones, and the wait is the caller's.
 
+use i2cbus
+use i2csample
+use i2cstatus
+use i2ctiming
+
 // ── Addresses ────────────────────────────────────────────────────────
 
 // The address with the ADDR pin tied to ground: 0x44 (§ 4.5, table 7).
@@ -45,6 +48,17 @@ pub const SHT3X_ADDR_HIGH = 0x45
 pub const SHT3X_CRC_POLYNOMIAL = 0x31
 // The CRC's initial value: 0xff.
 pub const SHT3X_CRC_INIT = 0xff
+
+// One byte folded into a running CRC-8, most significant bit first.
+@tier(embedded)
+fn crc8_byte(crc: Int, byte: Int) -> Int
+    var c = (crc ^ byte) & 0xff
+    for _ in 0..8
+        if (c & 0x80) != 0
+            c = ((c << 1) ^ SHT3X_CRC_POLYNOMIAL) & 0xff
+        else
+            c = (c << 1) & 0xff
+    c
 
 // The CRC-8 of two bytes, the way this part computes it.
 //
@@ -68,12 +82,12 @@ pub const SHT3X_CRC_INIT = 0xff
 // ```
 pub @tier(embedded)
 fn crc8(hi: Int, lo: Int) -> Int []
-    todo("i2c-devices-nv.sht3x.crc8")
+    crc8_byte(crc8_byte(SHT3X_CRC_INIT, hi), lo)
 
 // Whether a two-byte word and its checksum agree.
 pub @tier(embedded)
 fn crc_ok(hi: Int, lo: Int, crc: Int) -> Bool []
-    todo("i2c-devices-nv.sht3x.crc_ok")
+    crc8(hi, lo) == crc
 
 // ── Repeatability (§ 2.2, table 4) ───────────────────────────────────
 //
@@ -94,7 +108,8 @@ pub const SHT3X_REPEATABILITY_LOW = 2
 // The single-shot command for this repeatability, clock stretching
 // disabled (§ 4.3, table 8).
 //
-// 0x2400, 0x240b and 0x2416 for high, medium and low.
+// 0x2400, 0x240b and 0x2416 for high, medium and low.  A value that is
+// none of the three answers the high-repeatability command.
 //
 // ```novo
 // use sht3x
@@ -105,7 +120,12 @@ pub const SHT3X_REPEATABILITY_LOW = 2
 // ```
 pub @tier(embedded)
 fn measure_command(repeatability: Int) -> Int []
-    todo("i2c-devices-nv.sht3x.measure_command")
+    if repeatability == SHT3X_REPEATABILITY_MEDIUM
+        0x240b
+    elif repeatability == SHT3X_REPEATABILITY_LOW
+        0x2416
+    else
+        0x2400
 
 // How long a measurement at this repeatability takes.
 //
@@ -115,7 +135,12 @@ fn measure_command(repeatability: Int) -> Int []
 // that looks like a bus fault.
 pub @tier(embedded)
 fn conversion_time(repeatability: Int) -> I2cConversion []
-    todo("i2c-devices-nv.sht3x.conversion_time")
+    if repeatability == SHT3X_REPEATABILITY_MEDIUM
+        i2ctiming.conversion(6500)
+    elif repeatability == SHT3X_REPEATABILITY_LOW
+        i2ctiming.conversion(4500)
+    else
+        i2ctiming.conversion(15500)
 
 // ── The other commands (§ 4.9 to § 4.11) ─────────────────────────────
 
@@ -167,7 +192,7 @@ pub const SHT3X_STATUS_WRITE_CRC_FAILED = 0x0001
 // ```
 pub @tier(embedded)
 fn status_was_reset(status: Int) -> Bool []
-    todo("i2c-devices-nv.sht3x.status_was_reset")
+    (status & SHT3X_STATUS_RESET_DETECTED) != 0
 
 // Whether the status word says the heater is on.
 //
@@ -177,12 +202,30 @@ fn status_was_reset(status: Int) -> Bool []
 // it on reports a room that is warm and dry.
 pub @tier(embedded)
 fn status_heater_on(status: Int) -> Bool []
-    todo("i2c-devices-nv.sht3x.status_heater_on")
+    (status & SHT3X_STATUS_HEATER) != 0
 
-// The status word in words, one line, for a log.
+// The most important condition a status word reports, in words, for a
+// log line.
+//
+// A device writes no concatenated text, so one phrase answers for the
+// word, chosen in this order: the last write's checksum failed, the
+// last command was not processed, the part restarted, an alert is
+// pending, the heater is on, and otherwise that nothing is flagged.
+// The bits themselves are the `SHT3X_STATUS_*` constants.
 pub @tier(embedded)
 fn status_name(status: Int) -> Str []
-    todo("i2c-devices-nv.sht3x.status_name")
+    if (status & SHT3X_STATUS_WRITE_CRC_FAILED) != 0
+        "last write checksum failed"
+    elif (status & SHT3X_STATUS_COMMAND_FAILED) != 0
+        "last command not processed"
+    elif status_was_reset(status)
+        "part restarted"
+    elif (status & SHT3X_STATUS_ALERT) != 0
+        "alert pending"
+    elif status_heater_on(status)
+        "heater on"
+    else
+        "no flag set"
 
 // ── A reply ──────────────────────────────────────────────────────────
 
@@ -207,12 +250,23 @@ struct I2cShtReply
 // the check optional would have made it omittable.
 pub @tier(embedded)
 fn reply_from(w: I2cWord) -> I2cShtReply []
-    todo("i2c-devices-nv.sht3x.reply_from")
+    if w.ok and w.count == 6
+        let hi_t = i2cbus.byte_at(w, 0)
+        let lo_t = i2cbus.byte_at(w, 1)
+        let hi_h = i2cbus.byte_at(w, 3)
+        let lo_h = i2cbus.byte_at(w, 4)
+        I2cShtReply { raw_temp: (hi_t << 8) | lo_t,
+                      raw_hum: (hi_h << 8) | lo_h,
+                      temp_crc_ok: crc_ok(hi_t, lo_t, i2cbus.byte_at(w, 2)),
+                      hum_crc_ok: crc_ok(hi_h, lo_h, i2cbus.byte_at(w, 5)),
+                      ok: true }
+    else
+        I2cShtReply { raw_temp: 0, raw_hum: 0, temp_crc_ok: false, hum_crc_ok: false, ok: false }
 
 // Whether the whole reply is usable: six bytes and both checksums.
 pub @tier(embedded)
 fn reply_ok(r: I2cShtReply) -> Bool []
-    todo("i2c-devices-nv.sht3x.reply_ok")
+    r.ok and r.temp_crc_ok and r.hum_crc_ok
 
 // The `i2cstatus` code this reply carries.
 //
@@ -221,7 +275,12 @@ fn reply_ok(r: I2cShtReply) -> Bool []
 // `I2C_STATUS_OK` otherwise.
 pub @tier(embedded)
 fn reply_status(r: I2cShtReply) -> Int []
-    todo("i2c-devices-nv.sht3x.reply_status")
+    if not r.ok
+        i2cstatus.I2C_STATUS_DATA_NAK
+    elif not (r.temp_crc_ok and r.hum_crc_ok)
+        i2cstatus.I2C_STATUS_CRC
+    else
+        i2cstatus.I2C_STATUS_OK
 
 // ── The conversion (§ 4.13) ──────────────────────────────────────────
 
@@ -253,11 +312,11 @@ struct I2cShtReading
 // use sht3x
 //
 // fn main() [io]
-//     println("${sht3x.temperature_of(0x6666)}")   // 24999, about 25 C
+//     println("${sht3x.temperature_of(0x6666)}")   // 25000, which is 25 C
 // ```
 pub @tier(embedded)
 fn temperature_of(raw: Int) -> Int []
-    todo("i2c-devices-nv.sht3x.temperature_of")
+    -45000 + (175000 * (raw & 0xffff) + 32767) / SHT3X_SCALE
 
 // The relative humidity a raw word means, in thousandths of a percent.
 //
@@ -265,7 +324,7 @@ fn temperature_of(raw: Int) -> Int []
 // there is nothing to clamp.
 pub @tier(embedded)
 fn humidity_of(raw: Int) -> Int []
-    todo("i2c-devices-nv.sht3x.humidity_of")
+    (100000 * (raw & 0xffff) + 32767) / SHT3X_SCALE
 
 // Both, from a checked reply.
 //
@@ -273,17 +332,81 @@ fn humidity_of(raw: Int) -> Int []
 // valid, with both numbers zero.
 pub @tier(embedded)
 fn reading_of(r: I2cShtReply) -> I2cShtReading []
-    todo("i2c-devices-nv.sht3x.reading_of")
+    if reply_ok(r)
+        I2cShtReading { milli_c: temperature_of(r.raw_temp),
+                        milli_rh: humidity_of(r.raw_hum),
+                        valid: true }
+    else
+        I2cShtReading { milli_c: 0, milli_rh: 0, valid: false }
 
-// The temperature as a sample.
+// The temperature as a sample, valid when the reading is and the value
+// is inside the range the part is specified over.
 pub @tier(embedded)
 fn temperature(r: I2cShtReading) -> I2cSample []
-    todo("i2c-devices-nv.sht3x.temperature")
+    if r.valid
+        i2csample.range_checked(i2csample.sample(i2csample.I2C_Q_TEMPERATURE, r.milli_c))
+    else
+        i2csample.no_sample(i2csample.I2C_Q_TEMPERATURE)
 
-// The relative humidity as a sample.
+// The relative humidity as a sample, valid when the reading is.
 pub @tier(embedded)
 fn humidity(r: I2cShtReading) -> I2cSample []
-    todo("i2c-devices-nv.sht3x.humidity")
+    if r.valid
+        i2csample.range_checked(i2csample.sample(i2csample.I2C_Q_HUMIDITY, r.milli_rh))
+    else
+        i2csample.no_sample(i2csample.I2C_Q_HUMIDITY)
+
+// ── The dew point ────────────────────────────────────────────────────
+//
+// The Magnus formula is
+//
+//     gamma = ln(RH / 100) + a * T / (b + T)
+//     dew point = b * gamma / (a - gamma)
+//
+// with a = 17.62 and b = 243.12 over water.  A device has no `ln`, since
+// the standard library's expands to a libm call, so the logarithm is
+// computed here from integers: the argument is scaled into [0.707, 1.414)
+// by powers of two, whose logarithms are multiples of ln 2, and the rest
+// is the series 2 * (z + z^3/3 + z^5/5 + z^7/7 + z^9/9) with
+// z = (x - 1) / (x + 1), at most 0.172 in magnitude.  Every value is a
+// fixed-point number with 20 fractional bits.
+
+// 1.0 in the fixed-point format of the dew point arithmetic.
+const DEW_ONE = 1048576
+
+// ln 2, ln 100000, 17.62 and 243.12 in that format.
+const DEW_LN2 = 726817
+const DEW_LN_100000 = 12072177
+const DEW_A = 18475909
+const DEW_B = 254929797
+
+// The natural logarithm of a positive whole number, up to 2^20.
+@tier(embedded)
+fn dew_ln(x: Int) -> Int
+    var m = x << 20
+    var k = 0
+    for _ in 0..21
+        if m >= (2 << 20)
+            m = m >> 1
+            k = k + 1
+    // Above the square root of two, halve once more and count it, so
+    // that the series argument stays small on both sides of one.
+    if m > 1482910
+        m = m >> 1
+        k = k + 1
+    let z = ((m - DEW_ONE) << 20) / (m + DEW_ONE)
+    let z2 = (z * z) >> 20
+    var term = z
+    var sum = z
+    term = (term * z2) >> 20
+    sum = sum + term / 3
+    term = (term * z2) >> 20
+    sum = sum + term / 5
+    term = (term * z2) >> 20
+    sum = sum + term / 7
+    term = (term * z2) >> 20
+    sum = sum + term / 9
+    k * DEW_LN2 + 2 * sum
 
 // The dew point of a reading, in thousandths of a degree Celsius.
 //
@@ -293,11 +416,34 @@ fn humidity(r: I2cShtReading) -> I2cSample []
 // very different risks.  The Magnus approximation, which is accurate to
 // about 0.35 °C between -45 °C and +60 °C.
 //
-// Answers zero and is not meaningful outside that range; the caller
-// checks the temperature first.
+// Answers zero for a reading that is not valid, for a humidity of zero,
+// where the dew point is not a number, and for a temperature outside
+// that range, where the approximation is not specified.  Never answers
+// more than the temperature: at 100 %RH the dew point is the
+// temperature itself, and a humidity above 100 %, which the part cannot
+// report and a reading built by hand can carry, is held there.
+//
+// ```novo
+// use sht3x
+//
+// fn main() [io]
+//     let r = sht3x.I2cShtReading { milli_c: 25000, milli_rh: 50000, valid: true }
+//     println("${sht3x.dew_point(r)}")   // 13851, about 13.9 C
+// ```
 pub @tier(embedded)
 fn dew_point(r: I2cShtReading) -> Int []
-    todo("i2c-devices-nv.sht3x.dew_point")
+    if not r.valid or r.milli_rh <= 0 or r.milli_c < -45000 or r.milli_c > 60000
+        0
+    else
+        let gamma_rh = dew_ln(r.milli_rh) - DEW_LN_100000
+        let t = (r.milli_c << 20) / 1000
+        let gamma = gamma_rh + DEW_A * t / (DEW_B + t)
+        let td = DEW_B * gamma / (DEW_A - gamma)
+        let milli = (td * 1000 + (1 << 19)) >> 20
+        if milli > r.milli_c
+            r.milli_c
+        else
+            milli
 
 // ── Over a bus ───────────────────────────────────────────────────────
 
@@ -306,7 +452,7 @@ fn dew_point(r: I2cShtReading) -> Int []
 // The primitive every other bus function here is built from: two bytes,
 // most significant first, with no register pointer.
 pub fn command<B: I2cDeviceBus[e]>(b: B, addr: Int, cmd: Int) -> Bool [e]
-    todo("i2c-devices-nv.sht3x.command")
+    b.i2c_write_raw(addr, cmd, 2)
 
 // Stop any periodic measurement and soft-reset the part.
 //
@@ -316,17 +462,26 @@ pub fn command<B: I2cDeviceBus[e]>(b: B, addr: Int, cmd: Int) -> Bool [e]
 // left in periodic mode by a previous run changes nothing and then
 // finds its single-shot commands ignored too.
 pub fn reset<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
-    todo("i2c-devices-nv.sht3x.reset")
+    command(b, addr, SHT3X_CMD_BREAK) and command(b, addr, SHT3X_CMD_SOFT_RESET)
 
 // Read the status register, or -1.
 //
-// Three bytes: the status word and its checksum.
+// Three bytes: the status word and its checksum.  A transfer that did
+// not complete and one whose checksum disagrees both answer -1, since
+// a status word that is not checked is a restart that goes unseen.
 pub fn read_status<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Int [e]
-    todo("i2c-devices-nv.sht3x.read_status")
+    if not command(b, addr, SHT3X_CMD_READ_STATUS)
+        -1
+    else
+        let w = b.i2c_read_raw(addr, 3)
+        if w.ok and w.count == 3 and crc_ok(i2cbus.byte_at(w, 0), i2cbus.byte_at(w, 1), i2cbus.byte_at(w, 2))
+            i2cbus.be_u16_at(w, 0)
+        else
+            -1
 
 // Clear the status register's alert and reset-detected bits.
 pub fn clear_status<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
-    todo("i2c-devices-nv.sht3x.clear_status")
+    command(b, addr, SHT3X_CMD_CLEAR_STATUS)
 
 // Turn the on-chip heater on or off.
 //
@@ -336,12 +491,18 @@ pub fn clear_status<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
 // element.  It is not a thermostat and the temperature measured while
 // it is on is not the room's.
 pub fn set_heater<B: I2cDeviceBus[e]>(b: B, addr: Int, on: Bool) -> Bool [e]
-    todo("i2c-devices-nv.sht3x.set_heater")
+    command(b, addr, (if on then SHT3X_CMD_HEATER_ON else SHT3X_CMD_HEATER_OFF))
 
 // Trigger one single-shot measurement and answer how long it takes.
+//
+// A trigger that is not acknowledged answers `i2ctiming.not_started`, so
+// that the read which follows is refused.
 pub fn start_measurement<B: I2cDeviceBus[e]>(b: B, addr: Int,
                                              repeatability: Int) -> I2cConversion [e]
-    todo("i2c-devices-nv.sht3x.start_measurement")
+    if command(b, addr, measure_command(repeatability))
+        conversion_time(repeatability)
+    else
+        i2ctiming.not_started()
 
 // Read the six-byte reply, refusing a read that is too early.
 //
@@ -349,7 +510,10 @@ pub fn start_measurement<B: I2cDeviceBus[e]>(b: B, addr: Int,
 // `start_measurement`.  A part read too early NAKs, and this answers a
 // reply that is not ok rather than passing a bus fault up: the two are
 // diagnosed differently and only this function knows which one it is
-// looking at.
+// looking at.  A read made before the wait is over is not sent at all.
 pub fn read_reply<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cConversion,
                                       waited_micros: Int) -> I2cShtReply [e]
-    todo("i2c-devices-nv.sht3x.read_reply")
+    if i2ctiming.is_elapsed(c, waited_micros)
+        reply_from(b.i2c_read_raw(addr, 6))
+    else
+        reply_from(i2cbus.word_failed())

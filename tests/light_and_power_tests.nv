@@ -1,8 +1,6 @@
 // light_and_power_tests.nv — the two parts whose failure mode is a
 // number: a light sensor that saturates and a current monitor that
 // reads zero until it is calibrated.
-//
-// RED ON PURPOSE: the first `todo()` each test reaches ends it.
 
 use std.test
 use bh1750
@@ -129,8 +127,8 @@ fn test_the_bus_voltage_is_in_the_top_thirteen_bits() [io]
     // A driver that scales the whole word reports eight times the
     // voltage, which on a 3.3 V rail is 26 V and looks like a wiring
     // fault.
-    test.case("0x0678 is about 3.308 volts")
-    test.assert_eq(ina219.bus_uv_of(0x0678), 3308000)
+    test.case("0x19d8 is about 3.308 volts")
+    test.assert_eq(ina219.bus_uv_of(0x19d8), 3308000)
 
     test.case("the two flags live in the bottom bits")
     test.assert(ina219.bus_conversion_ready(0x0678 | ina219.INA219_BUS_CNVR))

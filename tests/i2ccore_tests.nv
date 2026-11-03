@@ -1,15 +1,5 @@
 // i2ccore_tests.nv — the four modules that are not a part: addresses,
 // the word a transfer answers, the faults, the units and the timing.
-//
-// RED ON PURPOSE.  Every body in this package is a `todo()`, so the
-// first call each test makes ends it with `not implemented`.  What the
-// suite checks today is that every signature can be SPELLED by a
-// consumer, with the types a consumer holds — which is the half of a
-// design that a reader cannot check by reading.
-//
-// The assertions are the ones the implementation will have to satisfy,
-// written now so that the first body is written against a test rather
-// than against a memory of the datasheet.
 
 use std.test
 use i2cbus

@@ -1,8 +1,6 @@
 // sht3x_tests.nv — the checksum, the two conversions, and the status
 // bit that says the part restarted.
 //
-// RED ON PURPOSE: the first `todo()` each test reaches ends it.
-//
 // THE DATASHEET PUBLISHES A CHECK VALUE, and it is the only number in
 // this module that cannot be derived by reading the source: SHT3x-DIS
 // § 4.4 gives 0xbeef a checksum of 0x92.  A CRC-8 that disagrees with

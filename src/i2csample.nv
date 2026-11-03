@@ -1,8 +1,6 @@
 // i2csample.nv — one measured quantity, in an integer unit, with the
 // range the part is specified over.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT and `@tier(embedded)` on all of it.
 //
 // INTEGERS, NOT FLOATS, AND THAT IS ABOUT THE TARGET.  A Cortex-M0+ has
@@ -76,14 +74,16 @@ struct I2cSample
 // ```
 pub @tier(embedded)
 fn sample(quantity: Int, value: Int) -> I2cSample []
-    todo("i2c-devices-nv.i2csample.sample")
+    I2cSample { quantity: quantity, value: value, valid: true }
 
 // A quantity this part does not measure, or did not measure.
 pub @tier(embedded)
 fn no_sample(quantity: Int) -> I2cSample []
-    todo("i2c-devices-nv.i2csample.no_sample")
+    I2cSample { quantity: quantity, value: 0, valid: false }
 
-// The quantity's unit in words, for a log line or a label.
+// The quantity's unit as an ASCII label, for a log line: `mC` for
+// thousandths of a degree Celsius, `m%RH`, `Pa`, `mlx`, `uV`, `uA` and
+// `uW`.  A quantity this package does not measure answers `?`.
 //
 // ```novo
 // use i2csample
@@ -93,12 +93,42 @@ fn no_sample(quantity: Int) -> I2cSample []
 // ```
 pub @tier(embedded)
 fn unit_name(quantity: Int) -> Str []
-    todo("i2c-devices-nv.i2csample.unit_name")
+    if quantity == I2C_Q_TEMPERATURE
+        "mC"
+    elif quantity == I2C_Q_HUMIDITY
+        "m%RH"
+    elif quantity == I2C_Q_PRESSURE
+        "Pa"
+    elif quantity == I2C_Q_ILLUMINANCE
+        "mlx"
+    elif quantity == I2C_Q_VOLTAGE
+        "uV"
+    elif quantity == I2C_Q_CURRENT
+        "uA"
+    elif quantity == I2C_Q_POWER
+        "uW"
+    else
+        "?"
 
 // The quantity in words.
 pub @tier(embedded)
 fn quantity_name(quantity: Int) -> Str []
-    todo("i2c-devices-nv.i2csample.quantity_name")
+    if quantity == I2C_Q_TEMPERATURE
+        "temperature"
+    elif quantity == I2C_Q_HUMIDITY
+        "humidity"
+    elif quantity == I2C_Q_PRESSURE
+        "pressure"
+    elif quantity == I2C_Q_ILLUMINANCE
+        "illuminance"
+    elif quantity == I2C_Q_VOLTAGE
+        "voltage"
+    elif quantity == I2C_Q_CURRENT
+        "current"
+    elif quantity == I2C_Q_POWER
+        "power"
+    else
+        "unknown quantity"
 
 // ── Reading one for a person ─────────────────────────────────────────
 //
@@ -121,7 +151,7 @@ fn quantity_name(quantity: Int) -> Str []
 // ```
 pub @tier(embedded)
 fn whole(milli: Int) -> Int []
-    todo("i2c-devices-nv.i2csample.whole")
+    milli / 1000
 
 // The fractional thousandths of a thousandths-scaled value, always
 // positive, 0 to 999.
@@ -132,7 +162,10 @@ fn whole(milli: Int) -> Int []
 // `is_negative`.
 pub @tier(embedded)
 fn milli_fraction(milli: Int) -> Int []
-    todo("i2c-devices-nv.i2csample.milli_fraction")
+    if milli < 0
+        -(milli % 1000)
+    else
+        milli % 1000
 
 // Whether the value is below zero.
 //
@@ -142,7 +175,7 @@ fn milli_fraction(milli: Int) -> Int []
 // appears for one degree of the range.
 pub @tier(embedded)
 fn is_negative(milli: Int) -> Bool []
-    todo("i2c-devices-nv.i2csample.is_negative")
+    milli < 0
 
 // ── The ranges a part is specified over ──────────────────────────────
 
@@ -150,18 +183,46 @@ fn is_negative(milli: Int) -> Bool []
 // to measure, in the quantity's unit.
 //
 // Temperature -40000 (-40 °C), humidity 0, pressure 30000 Pa,
-// illuminance 0, and the electrical quantities are signed and have no
-// floor worth asserting, so they answer the smallest value their
-// register can hold.
+// illuminance 0, voltage 0 and power 0.  Current is signed in both
+// directions and has no floor that holds for every shunt, so it answers
+// -2147483648 microamperes, which no calibration reaches.  A quantity
+// this package does not measure answers 0 here and -1 from
+// `quantity_max`, a range that no value is inside.
 pub @tier(embedded)
 fn quantity_min(quantity: Int) -> Int []
-    todo("i2c-devices-nv.i2csample.quantity_min")
+    if quantity == I2C_Q_TEMPERATURE
+        -40000
+    elif quantity == I2C_Q_PRESSURE
+        30000
+    elif quantity == I2C_Q_CURRENT
+        -2147483648
+    else
+        0
 
 // The highest value of `quantity` any part in this package is specified
 // to measure, in the quantity's unit.
+//
+// Temperature 125000 (125 °C, the SHT3x's limit), humidity 100000,
+// pressure 110000 Pa, illuminance 121600000 (121 600 lux, above the
+// BH1750's highest ceiling of 121 556 lux), voltage 32764000 (the
+// INA219's largest bus register value), current 2147483647
+// microamperes and power 2147483647 microwatts.
 pub @tier(embedded)
 fn quantity_max(quantity: Int) -> Int []
-    todo("i2c-devices-nv.i2csample.quantity_max")
+    if quantity == I2C_Q_TEMPERATURE
+        125000
+    elif quantity == I2C_Q_HUMIDITY
+        100000
+    elif quantity == I2C_Q_PRESSURE
+        110000
+    elif quantity == I2C_Q_ILLUMINANCE
+        121600000
+    elif quantity == I2C_Q_VOLTAGE
+        32764000
+    elif quantity == I2C_Q_CURRENT or quantity == I2C_Q_POWER
+        2147483647
+    else
+        -1
 
 // Whether a sample is inside the range its quantity is specified over.
 //
@@ -181,7 +242,7 @@ fn quantity_max(quantity: Int) -> Int []
 // ```
 pub @tier(embedded)
 fn in_range(s: I2cSample) -> Bool []
-    todo("i2c-devices-nv.i2csample.in_range")
+    s.value >= quantity_min(s.quantity) and s.value <= quantity_max(s.quantity)
 
 // The sample, with `valid` cleared when it is outside its range.
 //
@@ -189,4 +250,4 @@ fn in_range(s: I2cSample) -> Bool []
 // never leaves the package looking like a measurement.
 pub @tier(embedded)
 fn range_checked(s: I2cSample) -> I2cSample []
-    todo("i2c-devices-nv.i2csample.range_checked")
+    I2cSample { quantity: s.quantity, value: s.value, valid: s.valid and in_range(s) }

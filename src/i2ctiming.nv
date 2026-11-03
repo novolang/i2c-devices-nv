@@ -1,8 +1,6 @@
 // i2ctiming.nv — a conversion time is a number the caller waits, not a
 // sleep the driver hides.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT and `@tier(embedded)` on all of it.  There is no
 // clock in this package and there is no sleep: both are the caller's.
 //
@@ -30,13 +28,22 @@
 // REFUSES when it is not enough.  A caller cannot forget the wait,
 // because the second call will not produce a reading without it.
 
+use i2cstatus
+
 // How long a part needs before its measurement can be read.
+//
+// A conversion of -1 microseconds is the one that never started: a
+// `start_measurement` whose trigger was not acknowledged answers it, so
+// that the read which follows is refused instead of returning the
+// measurement the part made before.  `not_started` builds it and
+// `is_started` asks.
 pub @value
 struct I2cConversion
-    // The wait, in microseconds.
+    // The wait, in microseconds, or -1 when the conversion never
+    // started.
     micros: Int
 
-// A conversion of `micros` microseconds.
+// A conversion of `micros` microseconds.  A negative number is zero.
 //
 // ```novo
 // use i2ctiming
@@ -46,12 +53,12 @@ struct I2cConversion
 // ```
 pub @tier(embedded)
 fn conversion(micros: Int) -> I2cConversion []
-    todo("i2c-devices-nv.i2ctiming.conversion")
+    I2cConversion { micros: (if micros > 0 then micros else 0) }
 
 // The wait in microseconds.
 pub @tier(embedded)
 fn conversion_micros(c: I2cConversion) -> Int []
-    todo("i2c-devices-nv.i2ctiming.conversion_micros")
+    c.micros
 
 // The wait in whole milliseconds, ROUNDED UP.
 //
@@ -70,7 +77,10 @@ fn conversion_micros(c: I2cConversion) -> Int []
 // ```
 pub @tier(embedded)
 fn conversion_millis_ceil(c: I2cConversion) -> Int []
-    todo("i2c-devices-nv.i2ctiming.conversion_millis_ceil")
+    if c.micros > 0
+        (c.micros + 999) / 1000
+    else
+        0
 
 // Whether a caller that waited `waited_micros` has waited long enough.
 //
@@ -84,21 +94,28 @@ fn conversion_millis_ceil(c: I2cConversion) -> Int []
 // ```
 pub @tier(embedded)
 fn is_elapsed(c: I2cConversion, waited_micros: Int) -> Bool []
-    todo("i2c-devices-nv.i2ctiming.is_elapsed")
+    is_started(c) and waited_micros >= c.micros
 
 // How much of the wait is left, in microseconds, or zero.
 pub @tier(embedded)
 fn remaining_micros(c: I2cConversion, waited_micros: Int) -> Int []
-    todo("i2c-devices-nv.i2ctiming.remaining_micros")
+    if is_started(c) and c.micros > waited_micros
+        c.micros - waited_micros
+    else
+        0
 
 // The `i2cstatus` code a read after this much waiting gets.
 //
 // `I2C_STATUS_OK` once the conversion time has elapsed and
-// `I2C_STATUS_NOT_READY` before it.  The one function every `read_*` in
+// `I2C_STATUS_NOT_READY` before it, and for a conversion that never
+// started.  The one function every `read_*` in
 // this package calls first.
 pub @tier(embedded)
 fn ready_status(c: I2cConversion, waited_micros: Int) -> Int []
-    todo("i2c-devices-nv.i2ctiming.ready_status")
+    if is_elapsed(c, waited_micros)
+        i2cstatus.I2C_STATUS_OK
+    else
+        i2cstatus.I2C_STATUS_NOT_READY
 
 // The longer of two conversions.
 //
@@ -119,7 +136,10 @@ fn ready_status(c: I2cConversion, waited_micros: Int) -> Int []
 // ```
 pub @tier(embedded)
 fn longest(a: I2cConversion, b: I2cConversion) -> I2cConversion []
-    todo("i2c-devices-nv.i2ctiming.longest")
+    if a.micros >= b.micros
+        a
+    else
+        b
 
 // A conversion that is already finished: zero microseconds.
 //
@@ -129,4 +149,20 @@ fn longest(a: I2cConversion, b: I2cConversion) -> I2cConversion []
 // produces.
 pub @tier(embedded)
 fn immediate() -> I2cConversion []
-    todo("i2c-devices-nv.i2ctiming.immediate")
+    I2cConversion { micros: 0 }
+
+// The conversion of a measurement that never started.
+//
+// What a `start_measurement` answers when the part did not acknowledge
+// its trigger.  `is_elapsed` is false for it however long the caller
+// waits, so the read that follows is refused.  `longest` of it and
+// another conversion is the other one, so a node that triggers three
+// parts and loses one still waits for the other two.
+pub @tier(embedded)
+fn not_started() -> I2cConversion []
+    I2cConversion { micros: -1 }
+
+// Whether the conversion started: false only for `not_started`.
+pub @tier(embedded)
+fn is_started(c: I2cConversion) -> Bool []
+    c.micros >= 0

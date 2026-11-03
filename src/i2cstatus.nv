@@ -1,8 +1,6 @@
 // i2cstatus.nv — the seven ways a reading does not arrive, as codes a
 // device can carry, and which of them a retry can fix.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT and `@tier(embedded)` on all of it.  Nothing here
 // touches a bus and nothing here allocates.
 //
@@ -82,7 +80,7 @@ pub const I2C_STATUSES = 9
 // ```
 pub @tier(embedded)
 fn is_ok(status: Int) -> Bool []
-    todo("i2c-devices-nv.i2cstatus.is_ok")
+    status == I2C_STATUS_OK
 
 // Whether repeating the same transaction could succeed.
 //
@@ -101,7 +99,7 @@ fn is_ok(status: Int) -> Bool []
 // ```
 pub @tier(embedded)
 fn is_transient(status: Int) -> Bool []
-    todo("i2c-devices-nv.i2cstatus.is_transient")
+    status == I2C_STATUS_DATA_NAK or status == I2C_STATUS_CRC or status == I2C_STATUS_NOT_READY
 
 // Whether the code names something a person has to fix with their
 // hands.
@@ -112,7 +110,7 @@ fn is_transient(status: Int) -> Bool []
 // first.
 pub @tier(embedded)
 fn is_wiring(status: Int) -> Bool []
-    todo("i2c-devices-nv.i2cstatus.is_wiring")
+    status == I2C_STATUS_ADDRESS_NAK or status == I2C_STATUS_WRONG_CHIP
 
 // How long a caller must still wait before retrying, in microseconds.
 //
@@ -122,7 +120,10 @@ fn is_wiring(status: Int) -> Bool []
 // as many as the conversion is long.
 pub @tier(embedded)
 fn retry_after_micros(status: Int, conversion_micros: Int, waited_micros: Int) -> Int []
-    todo("i2c-devices-nv.i2cstatus.retry_after_micros")
+    if status == I2C_STATUS_NOT_READY and conversion_micros > waited_micros
+        conversion_micros - waited_micros
+    else
+        0
 
 // The code in words, for a device's log line.
 //
@@ -137,4 +138,23 @@ fn retry_after_micros(status: Int, conversion_micros: Int, waited_micros: Int) -
 // ```
 pub @tier(embedded)
 fn status_name(status: Int) -> Str []
-    todo("i2c-devices-nv.i2cstatus.status_name")
+    if status == I2C_STATUS_OK
+        "ok"
+    elif status == I2C_STATUS_ADDRESS_NAK
+        "address not acknowledged"
+    elif status == I2C_STATUS_DATA_NAK
+        "data byte not acknowledged"
+    elif status == I2C_STATUS_CRC
+        "checksum mismatch"
+    elif status == I2C_STATUS_WRONG_CHIP
+        "wrong chip at this address"
+    elif status == I2C_STATUS_NOT_READY
+        "read before the conversion finished"
+    elif status == I2C_STATUS_UNCALIBRATED
+        "no calibration"
+    elif status == I2C_STATUS_RESET_VALUE
+        "register holds its reset value"
+    elif status == I2C_STATUS_SATURATED
+        "at the top of the range"
+    else
+        "unknown status"

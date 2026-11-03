@@ -1,15 +1,14 @@
 // i2cbus.nv — the bus this package is written over, and the word a
 // transfer answers.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
-// `I2cDeviceBus[e]` IS THE TRAIT THAT CROSSES THE LAYER, and this
-// package implements it nowhere.  `e` is the effect row the
-// implementation supplies: `[hw]` for a peripheral on a
+// `I2cDeviceBus[e]` IS THE TRAIT THAT CROSSES THE LAYER.  `e` is the
+// effect row the implementation supplies: `[hw]` for a peripheral on a
 // microcontroller, `[fs, ffi]` for a Linux `/dev/i2c-N` device behind a
-// binding, and NOTHING for a table of recorded bytes in a test.  Every
-// function written over the trait costs what its argument costs
-// (SPEC § 5.6), which is why this package declares no effect of its own.
+// binding, and NOTHING for a table of recorded bytes in a test.  `i2cboard`
+// implements it for the board's I2C bus and is the only implementation in
+// this package.  Every function written over the trait costs what its
+// argument costs (SPEC § 5.6), which is why none of them declares an
+// effect of its own.
 //
 // A TRANSFER ANSWERS UP TO EIGHT BYTES IN ONE INTEGER, and that is
 // arithmetic rather than a trick.  An `Int` is sixty-four bits, eight
@@ -27,6 +26,8 @@
 // so the part answers from a register nobody asked about, correctly,
 // with no error anywhere.  `i2c_read` is therefore a primitive rather
 // than a convenience over `i2c_write` and a separate read.
+
+use i2cstatus
 
 // ── Addresses ────────────────────────────────────────────────────────
 
@@ -52,7 +53,7 @@ pub const I2C_ADDR_MAX = 0x77
 // ```
 pub @tier(embedded)
 fn addr_is_valid(addr: Int) -> Bool []
-    todo("i2c-devices-nv.i2cbus.addr_is_valid")
+    addr >= I2C_ADDR_MIN and addr <= I2C_ADDR_MAX
 
 // The seven-bit address a datasheet's eight-bit "write address" means.
 //
@@ -71,7 +72,7 @@ fn addr_is_valid(addr: Int) -> Bool []
 // ```
 pub @tier(embedded)
 fn addr_from_write_byte(write_byte: Int) -> Int []
-    todo("i2c-devices-nv.i2cbus.addr_from_write_byte")
+    (write_byte >> 1) & 0x7f
 
 // The eight-bit write address a datasheet prints for this part.
 //
@@ -79,7 +80,7 @@ fn addr_from_write_byte(write_byte: Int) -> Int []
 // diagram against their code.
 pub @tier(embedded)
 fn write_byte_of_addr(addr: Int) -> Int []
-    todo("i2c-devices-nv.i2cbus.write_byte_of_addr")
+    (addr << 1) & 0xfe
 
 // ── What a transfer answers ──────────────────────────────────────────
 
@@ -107,7 +108,29 @@ struct I2cWord
     // Whether the transaction completed and every byte was received.
     ok: Bool
 
+// The low `n * 8` bits of `bits`, for `n` of 0 through 8.
+@tier(embedded)
+fn low_bits(bits: Int, n: Int) -> Int
+    if n <= 0
+        0
+    elif n >= 8
+        bits
+    else
+        bits & ((1 << (8 * n)) - 1)
+
+// A sixteen-bit pattern as a signed value.
+@tier(embedded)
+fn sign16(v: Int) -> Int
+    if v >= 0x8000
+        v - 0x10000
+    else
+        v
+
 // A word from bytes already in hand, for a test or a replayed capture.
+//
+// `bits` holds `count` bytes, the first off the bus in the highest of
+// them.  Bits above `count * 8` are cleared, and `count` is held to 0
+// through 8.
 //
 // ```novo
 // use i2cbus
@@ -117,17 +140,23 @@ struct I2cWord
 // ```
 pub @tier(embedded)
 fn word(bits: Int, count: Int) -> I2cWord []
-    todo("i2c-devices-nv.i2cbus.word")
+    let n = if count < 0
+        0
+    else if count > 8
+        8
+    else
+        count
+    I2cWord { bits: low_bits(bits, n), count: n, ok: true }
 
 // The word a failed transfer answers: no bytes, not ok.
 pub @tier(embedded)
 fn word_failed() -> I2cWord []
-    todo("i2c-devices-nv.i2cbus.word_failed")
+    I2cWord { bits: 0, count: 0, ok: false }
 
 // Whether the transfer completed.
 pub @tier(embedded)
 fn word_ok(w: I2cWord) -> Bool []
-    todo("i2c-devices-nv.i2cbus.word_ok")
+    w.ok
 
 // The `i2cstatus` code this word carries.
 //
@@ -136,7 +165,10 @@ fn word_ok(w: I2cWord) -> Bool []
 // nobody answered, and every finer diagnosis belongs to the part.
 pub @tier(embedded)
 fn word_status(w: I2cWord) -> Int []
-    todo("i2c-devices-nv.i2cbus.word_status")
+    if w.ok
+        i2cstatus.I2C_STATUS_OK
+    else
+        i2cstatus.I2C_STATUS_ADDRESS_NAK
 
 // Byte `i` of the word, counting from the first byte off the bus.
 //
@@ -152,7 +184,10 @@ fn word_status(w: I2cWord) -> Int []
 // ```
 pub @tier(embedded)
 fn byte_at(w: I2cWord, i: Int) -> Int []
-    todo("i2c-devices-nv.i2cbus.byte_at")
+    if i < 0 or i >= w.count
+        0
+    else
+        (w.bits >>> (8 * (w.count - 1 - i))) & 0xff
 
 // Two bytes at `i` read most significant byte first, unsigned.
 //
@@ -161,7 +196,7 @@ fn byte_at(w: I2cWord, i: Int) -> Int []
 // block is in it — see the note there.
 pub @tier(embedded)
 fn be_u16_at(w: I2cWord, i: Int) -> Int []
-    todo("i2c-devices-nv.i2cbus.be_u16_at")
+    (byte_at(w, i) << 8) | byte_at(w, i + 1)
 
 // Two bytes at `i` read most significant byte first, as a signed
 // sixteen-bit value.
@@ -172,7 +207,7 @@ fn be_u16_at(w: I2cWord, i: Int) -> Int []
 // review.
 pub @tier(embedded)
 fn be_i16_at(w: I2cWord, i: Int) -> Int []
-    todo("i2c-devices-nv.i2cbus.be_i16_at")
+    sign16(be_u16_at(w, i))
 
 // Two bytes at `i` read LEAST significant byte first, unsigned.
 //
@@ -184,13 +219,13 @@ fn be_i16_at(w: I2cWord, i: Int) -> Int []
 // degrees.
 pub @tier(embedded)
 fn le_u16_at(w: I2cWord, i: Int) -> Int []
-    todo("i2c-devices-nv.i2cbus.le_u16_at")
+    byte_at(w, i) | (byte_at(w, i + 1) << 8)
 
 // Two bytes at `i` read least significant byte first, as a signed
 // sixteen-bit value.
 pub @tier(embedded)
 fn le_i16_at(w: I2cWord, i: Int) -> Int []
-    todo("i2c-devices-nv.i2cbus.le_i16_at")
+    sign16(le_u16_at(w, i))
 
 // Three bytes at `i` as a twenty-bit measurement, most significant byte
 // first.
@@ -201,7 +236,7 @@ fn le_i16_at(w: I2cWord, i: Int) -> Int []
 // twenty-four bits gets a number sixteen times too large.
 pub @tier(embedded)
 fn be_u20_at(w: I2cWord, i: Int) -> Int []
-    todo("i2c-devices-nv.i2cbus.be_u20_at")
+    (byte_at(w, i) << 12) | (byte_at(w, i + 1) << 4) | (byte_at(w, i + 2) >> 4)
 
 // ── The bus ──────────────────────────────────────────────────────────
 
@@ -246,14 +281,18 @@ pub trait I2cDeviceBus[e]
 // transfer for its side effect — a configuration write read back, a
 // pointer set — and has nothing to do with the bytes.
 pub fn read_reg_checked<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int, n: Int) -> Int [e]
-    todo("i2c-devices-nv.i2cbus.read_reg_checked")
+    word_status(b.i2c_read_reg(addr, reg, n))
 
 // Read one register byte, or -1 when the transfer did not complete.
 //
 // The convenience an identification check wants, where the value is one
 // byte and the only thing to do about a failure is to give up.
 pub fn read_byte<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int) -> Int [e]
-    todo("i2c-devices-nv.i2cbus.read_byte")
+    let w = b.i2c_read_reg(addr, reg, 1)
+    if w.ok
+        byte_at(w, 0)
+    else
+        -1
 
 // Set and clear bits of one register, reading it first.
 //
@@ -262,7 +301,11 @@ pub fn read_byte<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int) -> Int [e]
 // unrelated fields loses two of them to a driver that writes the whole
 // byte.  `set` is ORed in and `clear` is masked out, `clear` first.
 pub fn update_reg<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int, clear: Int, set: Int) -> Bool [e]
-    todo("i2c-devices-nv.i2cbus.update_reg")
+    let old = read_byte(b, addr, reg)
+    if old < 0
+        false
+    else
+        b.i2c_write_reg(addr, reg, ((old & ~clear) | set) & 0xff)
 
 // The next address at or after `from` that answers, or -1.
 //
@@ -271,7 +314,15 @@ pub fn update_reg<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int, clear: Int, set
 // battery-powered node is a measurable amount of charge.  A caller that
 // knows its parts should not scan at all.
 pub fn scan_next<B: I2cDeviceBus[e]>(b: B, from: Int) -> Int [e]
-    todo("i2c-devices-nv.i2cbus.scan_next")
+    let first = if from > I2C_ADDR_MIN
+        from
+    else
+        I2C_ADDR_MIN
+    var found = -1
+    for addr in first..I2C_ADDR_MAX + 1
+        if found < 0 and b.i2c_present(addr)
+            found = addr
+    found
 
 // Whether the part at `addr` identifies itself as `expected`.
 //
@@ -279,4 +330,4 @@ pub fn scan_next<B: I2cDeviceBus[e]>(b: B, from: Int) -> Int [e]
 // in this package makes before it writes anything: three different
 // parts share 0x76, and configuring the wrong one succeeds.
 pub fn chip_is<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int, expected: Int) -> Bool [e]
-    todo("i2c-devices-nv.i2cbus.chip_is")
+    read_byte(b, addr, reg) == expected

@@ -164,7 +164,7 @@ fn score() -> Int
         n = n + 1
     if bme280.raw_status(raw) == i2cstatus.I2C_STATUS_OK
         n = n + 1
-    let tcal = bme280.temp_cal_from(i2cbus.word(0x7011, 2))
+    let tcal = bme280.temp_cal_from(i2cbus.word(0x706b436718fc, 6))
     let reading = bme280.compensate_temperature(tcal, 519888)
     if reading.milli_c == 25080
         n = n + 1
@@ -285,7 +285,7 @@ fn score() -> Int
         n = n + 1
     if ina219.gain_for(100, 400000) == ina219.INA219_PGA_40MV
         n = n + 1
-    if ina219.bus_uv_of(0x0678) == 3308000
+    if ina219.bus_uv_of(0x19d8) == 3308000
         n = n + 1
     if ina219.shunt_uv_of(-1000) == -10000
         n = n + 1
@@ -319,11 +319,11 @@ fn score() -> Int
 @tier(rt)
 fn main() [hw]
     bsp.board.init()
-    // 92 is the number of checks in `score`.  The count is printed on a
+    // 104 is the number of checks in `score`.  The count is printed on a
     // failure rather than only compared, so a device that disagrees with
     // the host says HOW MANY it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 92
+    if n == 104
         hal.uart.write("PASS: i2c-devices-embedded\n")
     else
         hal.uart.write("FAIL: i2c-devices-embedded score=")

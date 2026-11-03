@@ -6,20 +6,17 @@ parts over a shared clock and a shared data line, specified in NXP's
 the sensors a battery-powered measuring device carries are on it. This
 package brings four of them to novo-lang: the Bosch BME280 environment
 sensor, the Sensirion SHT3x humidity sensor, the ROHM BH1750FVI light
-sensor and the Texas Instruments INA219 current monitor.
-
-**Status: NOT IMPLEMENTED — interface only.**  Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called.  The package is published so its design can be
-reviewed and depended on before it is implemented.  Version 0.1.0 will
-be the first working release.
+sensor and the Texas Instruments INA219 current monitor. It also
+provides `I2cDeviceBus`, the bus the drivers are written over, and
+implements it for the I2C bus of a board through
+[embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv).
 
 ## What it is
 
 A sensor on an I2C bus does not answer a temperature. It answers a
 number in one of its registers, and turning that number into a
 temperature takes a calculation the part's manufacturer publishes in its
-datasheet. For the BME280 the calculation needs twenty-six bytes of
+datasheet. For the BME280 the calculation needs thirty-three bytes of
 calibration data burned into the individual part at manufacture, and it
 is thirty lines of integer arithmetic. For the SHT3x it is one
 multiplication and one subtraction, after a checksum has been verified.
@@ -30,11 +27,13 @@ datasheet it comes from written beside it.
 
 The rest of it is the bus. A driver has to write a register, read some
 bytes back and know what to do when nothing answers. Those operations
-are declared here as a trait, `I2cDeviceBus`, and this package
-implements it for nothing: a program supplies a bus of its own, over a
-microcontroller's peripheral, over a Linux kernel device, or over a
-table of bytes recorded from a real part. Every driver function is
-written once against the trait and works over all three.
+are declared here as a trait, `I2cDeviceBus`. A transfer answers up to
+eight bytes in one integer, so a whole burst is a value in the caller's
+stack frame and nothing is allocated. `i2cboard` implements the trait for
+a board's I2C bus. A program can implement it for anything else: a Linux
+kernel device, or a table of bytes recorded from a real part. Every
+driver function is written once against the trait and works over all of
+them.
 
 **Measurement is not instantaneous.** Each part here measures when it is
 asked to, and each takes time: about nine milliseconds for the BME280 at
@@ -53,13 +52,13 @@ second takes how long the caller actually waited, and refuses to produce
 a reading when that is not enough. Nothing in this package sleeps,
 consults a clock or holds the bus while a part converts.
 
-**Nothing here performs input or output.** The parts of the package that
-compute — every register constant, every compensation formula, the
-Sensirion checksum, the unit conversions — are ordinary functions over
-integers. The parts that talk to a part are written over the bus trait,
-so what they cost is whatever the program's own bus costs. A program
-whose bus is a microcontroller peripheral pays for hardware access; a
-test whose bus is a recorded table pays nothing.
+**What a device program is charged.** The calculations perform no input
+or output and declare no effect: every register constant, every
+compensation formula, the Sensirion checksum and the unit conversions
+are ordinary functions over integers. The functions that talk to a part
+cost what the bus costs. Over `i2cboard` that is `[hw]`, the effect of
+reaching the board's I2C hardware, and over a recorded table it is
+nothing.
 
 ## Install
 
@@ -69,90 +68,111 @@ novo pkg add i2c-devices-nv
 
 ## Example
 
+A device program: open the board's bus, check which part answered, read
+its calibration, take one measurement and print the temperature. The
+program waits with the board's own timer, because the package does not
+wait for it.
+
 ```novo
+use std.str
 use bme280
-use i2cbus
+use i2cboard
 use i2csample
-use i2cstatus
+use i2ctiming
 
-// The program's own bus.  A real one drives a peripheral; this one
-// answers bytes from a recording, which is what a test uses.
-struct RecordedBus
-    bytes: Int
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
 
-impl I2cDeviceBus[] for RecordedBus
-    fn i2c_write_reg(self, addr: Int, reg: Int, val: Int) -> Bool
-        true
-    fn i2c_read_reg(self, addr: Int, reg: Int, n: Int) -> I2cWord
-        i2cbus.word(self.bytes, n)
-    fn i2c_write_raw(self, addr: Int, bytes: Int, len: Int) -> Bool
-        true
-    fn i2c_read_raw(self, addr: Int, n: Int) -> I2cWord
-        i2cbus.word(self.bytes, n)
-    fn i2c_present(self, addr: Int) -> Bool
-        true
-    fn i2c_frequency(self) -> Int
-        400000
-
-fn main() [io]
-    let bus = RecordedBus { bytes: 0x6684000082f80080 }
+    // The board's first I2C bus, at 400 kHz.
+    let bus = i2cboard.open(0, 400000)
     let addr = bme280.BME280_ADDR_LOW
 
     // Three parts share this address, so ask which one answered.
     if bme280.identify(bus, addr) != bme280.BME280_CHIP_ID
-        println("not a BME280")
+        hal.uart.write("no BME280\n")
         return
 
-    // Read the part's own calibration data.  Done once and kept: it is
-    // thirty-three bytes and it never changes.
+    // The part's own calibration data: read once and kept, because it
+    // is thirty-three bytes and never changes.
     let cal = bme280.read_calibration(bus, addr)
 
     // Configure the part and take one measurement.  `start_measurement`
     // answers how long the measurement will take.
     let settings = bme280.weather_monitoring()
-    let _ = bme280.configure(bus, addr, settings)
     let wait = bme280.start_measurement(bus, addr, settings)
 
-    // Wait, by whatever means the program has, and say how long it
-    // waited.  A read that waited too little is refused.
-    let waited = wait.micros
-    let raw = bme280.read_raw(bus, addr, wait, waited)
+    // Wait, rounding up to the millisecond, and say how long that was.
+    // A read that waited too little is refused.
+    let millis = i2ctiming.conversion_millis_ceil(wait)
+    hal.timer.delay_ms(millis)
+    let raw = bme280.read_raw(bus, addr, wait, millis * 1000)
 
     // Turn the raw registers into numbers.  Temperature first: the
     // pressure and humidity calculations both need a value it produces.
-    let reading = bme280.compensate(cal, raw)
-    let t = bme280.temperature(reading)
+    let t = bme280.temperature(bme280.compensate(cal, raw))
 
     // The temperature is in thousandths of a degree Celsius.
     if t.valid
-        println("${i2csample.whole(t.value)}.${i2csample.milli_fraction(t.value)} C")
+        hal.uart.write(str.from_int(t.value))
+        hal.uart.write(" ")
+        hal.uart.write(i2csample.unit_name(t.quantity))
+        hal.uart.write("\n")
     else
-        println(i2cstatus.status_name(bme280.raw_status(raw)))
+        hal.uart.write("no reading\n")
 ```
 
-Build and test with `novo pkg build` and `novo test tests`. Today
-`novo test` fails on purpose: every test reaches a `not implemented`
-panic.
+The calculations also work on bytes already in hand, with no bus. This
+program compensates the datasheet's own example: a raw temperature of
+519888 against the example coefficients, which Bosch gives as 25.08 °C.
+
+```novo
+use bme280
+use i2cbus
+
+fn main() [io]
+    // dig_T1 27504, dig_T2 26435 and dig_T3 -1000, as the six bytes the
+    // part stores them in: least significant byte first.
+    let cal = bme280.temp_cal_from(i2cbus.word(0x706b436718fc, 6))
+    let reading = bme280.compensate_temperature(cal, 519888)
+
+    // Thousandths of a degree Celsius.
+    println("${reading.milli_c}")   // 25080
+```
+
+Build and test with `novo pkg build` and `novo test tests`.
 
 ## What the package contains
 
 | Module | Contents |
 | --- | --- |
+| `i2cboard` | The bus of a board: `I2cDeviceBus` implemented for embedded-hal-nv's `BoardI2c`, and the two conversions between a list of bytes and a transfer's word. |
 | `i2cbus` | The bus, as a trait a program implements: write a register, read up to eight bytes, write and read without a register pointer, and ask whether anything is at an address. Also the arithmetic that takes bytes out of a transfer, in both byte orders, and the conversion between the two ways a datasheet prints an address. |
 | `i2cstatus` | The nine codes a driver answers when a reading does not arrive, and which of them a retry can fix. |
 | `i2cfault` | The same nine as a value that carries the address, the checksums or the raw word that explain it, for a program with a log. |
 | `i2ctiming` | How long a part needs before its measurement can be read, and whether a caller has waited that long. |
 | `i2csample` | One measured quantity in an integer unit, the seven quantities the package measures, the range each part is specified over, and the pieces of a printed number. |
 | `bme280` | The Bosch BME280 and the BMP280 that shares its address: the register map, the three sets of recommended settings, the calibration data, and the compensation calculations for temperature, pressure and humidity. |
-| `sht3x` | The Sensirion SHT3x-DIS: the commands, the CRC-8 every reply carries, the two conversions and the status register. |
+| `sht3x` | The Sensirion SHT3x-DIS: the commands, the CRC-8 every reply carries, the two conversions, the dew point and the status register. |
 | `bh1750` | The ROHM BH1750FVI: the opcodes, the measurement time register and the illuminance conversion. |
 | `ina219` | The Texas Instruments INA219: the six registers, the configuration word, the calibration a caller computes from its own shunt resistor, and the four values one poll produces. |
+
+| Quantity | Unit | Part |
+| --- | --- | --- |
+| Temperature | thousandths of a degree Celsius | BME280, SHT3x |
+| Relative humidity | thousandths of a percent | BME280, SHT3x |
+| Pressure | pascals | BME280 |
+| Illuminance | thousandths of a lux | BH1750 |
+| Voltage | microvolts | INA219 |
+| Current | microamperes | INA219 |
+| Power | microwatts | INA219 |
 
 ## How to choose an entry point
 
 **A program with a bus calls the part's own module.** `bme280`,
 `sht3x`, `bh1750` and `ina219` each have a `start_measurement` and a
-`read_*` pair that take a bus, and that is the ordinary way in.
+`read_*` pair that take a bus, and that is the ordinary way in. On a
+board, `i2cboard.open` makes the bus.
 
 **A program with bytes already in hand calls the calculations
 directly.** Every conversion — `bme280.compensate`,
@@ -161,9 +181,11 @@ takes numbers and returns numbers with no bus involved. That is the form
 to use when replaying a recording, when the bytes arrived by radio from
 somewhere else, or when writing a test.
 
-**Firmware calls the calculations and supplies its own bus.** The
-modules that compute build for a microcontroller with no heap allocator.
-See "Running on a microcontroller".
+**A program on a bus of its own implements `I2cDeviceBus`.** One method
+is a register write, two are the two kinds of read, one is a write with
+no register pointer, one is a presence probe and one reports the bus
+frequency. A table of recorded bytes is an implementation that performs
+nothing, and every driver function over it declares no effect.
 
 **A program that writes a log calls `i2cfault`; a program in firmware
 calls `i2cstatus`.** The two describe the same nine failures. The first
@@ -180,93 +202,120 @@ second is an integer.
    are used by the BME280, the BMP280 and the MS5611. Writing a BME280's
    configuration to a BMP280 succeeds, and the humidity register then
    reads a value that compensates to a number (BST-BME280-DS002 § 5.3).
+   `bme280.identify` and `bme280.read_calibration` read the identification
+   byte first.
 3. **Wait the conversion time, and pass how long you waited.** Every
    `read_*` takes the conversion its `start_*` answered and the elapsed
    microseconds, and refuses when they do not agree. Round the wait up
    to the millisecond with `i2ctiming.conversion_millis_ceil`: rounding
    8.7 down to 8 is a read that is too early on every cycle.
-4. **Compensate the BME280's temperature before its pressure or
+4. **A trigger that was not acknowledged is a conversion that never
+   started.** The `start_*` function then answers
+   `i2ctiming.not_started`, and the `read_*` that follows refuses
+   however long the caller waits. Without that, the BME280 would answer
+   the measurement it made before.
+5. **Compensate the BME280's temperature before its pressure or
    humidity.** The temperature calculation produces an intermediate the
    other two consume (BST-BME280-DS002 § 4.2.3). `bme280.compensate`
    does all three in the required order; the three separate functions
    must be called in that order by hand.
-5. **The BME280's calibration data is stored least significant byte
+6. **The BME280's calibration data is stored least significant byte
    first and its measurements most significant byte first**
    (BST-BME280-DS002 § 4.2.2 against § 5.4.7). `i2cbus` has a function
    for each order. Using one order for both gives a temperature that
    moves in the right direction and is wrong by tens of degrees.
-6. **Two of the BME280's humidity coefficients share a byte.** dig_H4
+7. **Two of the BME280's humidity coefficients share a byte.** dig_H4
    and dig_H5 are twelve bits each, packed into the three bytes at 0xe4
    to 0xe6, with the low nibble of 0xe5 belonging to the first and the
    high nibble to the second (BST-BME280-DS002 § 4.2.2, table 16).
-7. **Write the BME280's humidity oversampling register before its
+8. **Write the BME280's humidity oversampling register before its
    measurement control register.** Changes to `ctrl_hum` take effect
    only when `ctrl_meas` is next written (BST-BME280-DS002 § 5.4.3).
    `bme280.configure` does this; a program writing the registers itself
    must.
-8. **Read the BME280's eight measurement registers in one transfer.**
+9. **Read the BME280's eight measurement registers in one transfer.**
    In continuous mode the part can finish a new measurement between two
    single-register reads, so three bytes come from one measurement and
    three from the next (BST-BME280-DS002 § 4).
-9. **Check both of the SHT3x's checksums.** A measurement reply is six
-   bytes: two of temperature, a checksum over those two, two of
-   humidity, and a checksum over those two (SHT3x-DIS § 4.3). The check
-   is per pair, not per reply.
-10. **Break the SHT3x out of continuous measurement before using
+10. **The BME280's reset value is also a count it can measure.** The
+    pressure and temperature registers read 0x80000, and the humidity
+    register 0x8000, until the first conversion and when a channel is
+    skipped (BST-BME280-DS002 § 5.4). `raw_status` answers
+    `I2C_STATUS_RESET_VALUE` for a block that holds one. With the
+    datasheet's example coefficients a raw temperature of 0x80000 is
+    26.46 °C and a raw pressure of 0x80000 is 81874 Pa, so a part that
+    answers can produce it. A program that has configured every channel
+    and is refused for this reason takes another measurement.
+11. **Check both of the SHT3x's checksums.** A measurement reply is six
+    bytes: two of temperature, a checksum over those two, two of
+    humidity, and a checksum over those two (SHT3x-DIS § 4.3). The check
+    is per pair, not per reply. The status register's reply carries one
+    too, and `sht3x.read_status` answers -1 when it disagrees.
+12. **Break the SHT3x out of continuous measurement before using
     single-shot commands.** A part in that mode ignores every command
     except break and fetch, a soft reset included (SHT3x-DIS § 4.5).
-11. **The BH1750's reading saturates without saying so.** At the
+    `sht3x.reset` sends the break first.
+13. **The BH1750's reading saturates without saying so.** At the
     default measurement time the ceiling is about 54 612 lux, which is
     below direct sunlight. `bh1750.reading_status` answers
     `I2C_STATUS_SATURATED` there; lowering the measurement time register
     raises the ceiling to about 121 000 lux.
-12. **The BH1750's measurement time register scales the reading as well
+14. **The BH1750's measurement time register scales the reading as well
     as the integration.** Changing it without dividing the result by the
     same ratio reports a room that suddenly got brighter. `milli_lux_of`
-    takes the register value for that reason.
-13. **The INA219's current and power registers read zero until its
+    takes the register value for that reason, and `start_measurement`
+    writes the register every time so that a measurement does not depend
+    on what ran before it.
+15. **The INA219's current and power registers read zero until its
     calibration register is written** (SBOS448 § 8.5.1). Zero amperes is
     indistinguishable from an idle load. `ina219.current` and
     `ina219.power` answer an invalid sample against a part that has not
     been calibrated, and the two voltage registers are readable either
     way.
-14. **Read the INA219's power register last.** Reading it is what
+16. **Read the INA219's power register last.** Reading it is what
     clears the conversion-ready flag, so a loop that polls that flag and
     reads only the current register never finishes (SBOS448 § 8.6.3).
-15. **The INA219's overflow flag is the only warning of a bad
+    `ina219.read_reading` reads it last.
+17. **The INA219's overflow flag is the only warning of a bad
     calculation.** When the current or power exceeds the range the
     calibration set up, bit 0 of the bus voltage register is set and
     both registers hold meaningless values (SBOS448 § 8.6.3).
 
 ## Running on a microcontroller
 
-The modules that compute build for a microcontroller with no heap
-allocator: `i2cbus`'s byte and address arithmetic, `i2cstatus`,
-`i2ctiming`, `i2csample`, and every conversion in `bme280`, `sht3x`,
-`bh1750` and `ina219`. `tests/embedded_probe.nv` is a firmware program
-that calls ninety-two of them and is compiled for a Cortex-M as part of
-this package's checks, so the claim is built rather than asserted.
+These modules are written for the embedded tier, which allocates
+nothing and has no heap: `i2cbus`'s byte and address arithmetic,
+`i2cstatus`, `i2ctiming`, `i2csample`, and every conversion in `bme280`,
+`sht3x`, `bh1750` and `ina219`. The functions that drive a bus compile
+for firmware as well, over whatever bus the firmware supplies.
+`tests/embedded_probe.nv` is a firmware program that calls a hundred and
+four of the conversions. It is compiled for a Cortex-M with
+`novo build --target=nrf52-qemu`, and run in QEMU it prints `PASS` when
+every one of them gives on the device the number it gives on the host.
 
-Two things are excluded and each is excluded for a reason.
+Two modules are not embedded-tier code, and the registry measures the
+tiers of each module from its sources rather than taking them from this
+page.
 
-`i2cfault` is not, and nothing that is builds against it. Its values
-carry the address or the pair of checksums that explain a failure, and a
-value of that shape is allocated on a heap. A driver in firmware answers
-an `i2cstatus` code, which is an integer, and a program with a heap
-turns a code into a fault with `i2cfault.fault_of`.
+`i2cboard` is `@tier(rt)`. embedded-hal-nv moves a transfer as a list of
+bytes, and a list is allocated on the heap the runtime reserves. Each
+transaction through it is `[hw]`.
 
-The functions that drive a bus are not excluded so much as unfinished
-until a program supplies a bus. They are written over `I2cDeviceBus`,
-and the implementation is the program's: on a microcontroller it drives
-a peripheral, which is the one part of a measurement that touches
-hardware.
+`i2cfault` is `@tier(app)`. Its values carry the address or the pair of
+checksums that explain a failure, and a value of that shape is allocated
+on a heap. A driver in firmware answers an `i2cstatus` code, which is an
+integer, and a program with a heap turns a code into a fault with
+`i2cfault.fault_of`.
 
 ## What is not included
 
-- **A bus implementation.** This package drives parts; it does not
-  drive controllers. A microcontroller's I2C peripheral belongs to the
-  board support for that part, and a Linux `/dev/i2c-N` device needs an
-  `ioctl` call, which novo-lang reaches only through a C library.
+- **A bus for Linux.** A `/dev/i2c-N` device needs an `ioctl` call,
+  which novo-lang reaches only through a C library. A program that has
+  one implements `I2cDeviceBus` over it.
+- **The traits of devices-nv.** [devices-nv](https://novo-lang.org/packages/devices-nv)
+  defines the traits a program reads a thermometer, a hygrometer, a
+  barometer or a power manager through. The drivers here are called
+  directly and do not implement them.
 - **Clock stretching.** The SHT3x can hold the clock line low until its
   measurement is finished, so that a read issued immediately blocks
   until the answer is ready (SHT3x-DIS § 4.3). Fifteen milliseconds of a
@@ -301,6 +350,10 @@ hardware.
 
 ## Related packages
 
+- **embedded-hal-nv** defines `BoardI2c`, the handle that names one of a
+  board's I2C buses, and the sync and async traits that move a list of
+  bytes over it. `i2cboard` is the adapter between that interface and the
+  one these drivers are written over.
 - **crc-nv** publishes CRC-16/CCITT-FALSE, CRC-16/MODBUS, CRC-32 and
   CRC-32C. The SHT3x needs CRC-8 with polynomial 0x31 and an initial
   value of 0xff, which is not among them, and `crc-nv`'s value owns a
@@ -324,34 +377,30 @@ hardware.
 
 ## Tests
 
-The suite is five files under `tests/`, written against the signatures
-and red until the bodies land. What they assert is drawn from the
-datasheets rather than from an implementation: the BME280's own worked
-example of 519888 raw counts giving 25.08 °C (BST-BME280-DS002
-§ 4.2.3), the SHT3x's published checksum of 0x92 over the bytes 0xbe and
-0xef (SHT3x-DIS § 4.4), the measurement times each manufacturer states
-as a maximum, and the register values each part powers up holding.
+The suites under `tests/` take their expected values from the
+datasheets and from the manufacturers' reference routines rather than
+from this implementation: the BME280's own worked example of 519888 raw
+counts giving 25.08 °C and 415148 raw counts giving 100653 Pa
+(BST-BME280-DS002 § 4.2.3), the SHT3x's published checksum of 0x92 over
+the bytes 0xbe and 0xef (SHT3x-DIS § 4.4), the measurement times each
+manufacturer states as a maximum, and the register values each part
+powers up holding.
 
-`tests/i2cbus_tests.nv` also implements `I2cDeviceBus` over a table of
-bytes, which is both the shape a full test suite will take and the
-demonstration that a program's bus can be one that touches nothing.
+`tests/i2cbus_tests.nv` implements `I2cDeviceBus` over a table of bytes
+that performs nothing, so every driver function runs there with no
+effect declared.
+
+`tests/i2c_edge_tests.nv` implements it over a table of registers that
+keeps a log of every transaction in module-level state, and so declares
+`[mutate]`. A test can then check the order of the writes a driver
+makes, and make the transaction with a given number fail to check what
+the driver does at each step.
+
+`tests/i2c_board_tests.nv` runs `i2cboard` on the host, where the I2C bus
+has no device and every transaction is refused.
 
 `tests/embedded_probe.nv` is the microcontroller program described
 above.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `i2cbus` — the trait and the byte arithmetic | no |
-| `i2cstatus` — the nine codes | no |
-| `i2cfault` — the codes as values with their numbers | no |
-| `i2ctiming` — conversion times and the wait check | no |
-| `i2csample` — quantities, units and ranges | no |
-| `bme280` — registers, calibration and compensation | no |
-| `sht3x` — commands, checksum and conversions | no |
-| `bh1750` — opcodes, measurement time and illuminance | no |
-| `ina219` — registers, calibration and the four values | no |
 
 ## Licence
 

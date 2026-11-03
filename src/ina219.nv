@@ -1,7 +1,5 @@
 // ina219.nv — Texas Instruments' INA219 current and power monitor.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // References are to SBOS448, the part's own datasheet.
 //
 // THE CURRENT REGISTER READS ZERO UNTIL THE CALIBRATION REGISTER IS
@@ -24,6 +22,11 @@
 // bus voltage register's bit 0 is set and the current and power
 // registers hold meaningless values (§ 8.6.3).  Nothing else changes.
 // A driver that does not read that bit reports a number.
+
+use i2cbus
+use i2csample
+use i2cstatus
+use i2ctiming
 
 // ── Addresses ────────────────────────────────────────────────────────
 
@@ -146,18 +149,24 @@ struct I2cInaConfig
 // A configuration from its five fields.
 pub @tier(embedded)
 fn config(bus_range: Int, gain: Int, bus_adc: Int, shunt_adc: Int, mode: Int) -> I2cInaConfig []
-    todo("i2c-devices-nv.ina219.config")
+    I2cInaConfig { bus_range: bus_range,
+        gain: gain,
+        bus_adc: bus_adc,
+        shunt_adc: shunt_adc,
+        mode: mode }
 
 // The part's power-on configuration: 32 V, ÷8, twelve bits on both,
 // both continuous.
 pub @tier(embedded)
 fn default_config() -> I2cInaConfig []
-    todo("i2c-devices-nv.ina219.default_config")
+    config(INA219_BRNG_32V, INA219_PGA_320MV, INA219_ADC_12BIT, INA219_ADC_12BIT,
+           INA219_MODE_BOTH_CONTINUOUS)
 
 // The word this configuration writes to the configuration register.
 pub @tier(embedded)
 fn config_word(c: I2cInaConfig) -> Int []
-    todo("i2c-devices-nv.ina219.config_word")
+    ((c.bus_range & 0x01) << 13) | ((c.gain & 0x03) << 11) | ((c.bus_adc & 0x0f) << 7)
+        | ((c.shunt_adc & 0x0f) << 3) | (c.mode & 0x07)
 
 // The configuration a register word describes.
 //
@@ -166,7 +175,61 @@ fn config_word(c: I2cInaConfig) -> Int []
 // part also answers accepts the write and ignores it.
 pub @tier(embedded)
 fn config_from_word(w: Int) -> I2cInaConfig []
-    todo("i2c-devices-nv.ina219.config_from_word")
+    config((w >> 13) & 0x01, (w >> 11) & 0x03, (w >> 7) & 0x0f, (w >> 3) & 0x0f, w & 0x07)
+
+// The largest shunt resistance and promised current, in milliohms and
+// microamperes, that the calibration arithmetic accepts: a million
+// ohms and a thousand amperes, far past anything a part measures, and
+// small enough that no product here comes near 2^63.
+const INA219_LIMIT = 1000000000
+
+// A sixteen-bit register word as a signed count.  A count that is
+// already negative is left as it is.
+@tier(embedded)
+fn sign16(v: Int) -> Int
+    if v >= 0x8000
+        v - 0x10000
+    else
+        v
+
+// The time one ADC conversion takes at a four-bit setting, in
+// microseconds (§ 8.6.1, table 5).
+//
+// Settings 0 to 7 are the 9, 10, 11 and 12 bit conversions, the top bit
+// of the three being a don't-care in the register, so 4 to 7 repeat 0 to
+// 3.  Settings 8 to 15 are 12 bits averaged over 1, 2, 4 and so on to
+// 128 samples.
+@tier(embedded)
+fn adc_micros(setting: Int) -> Int
+    let s = setting & 0x0f
+    if s >= 8
+        // One sample at 12 bits, then the datasheet's averaged times.
+        if s == 8
+            532
+        elif s == INA219_ADC_2SAMPLE
+            1060
+        elif s == INA219_ADC_4SAMPLE
+            2130
+        elif s == INA219_ADC_8SAMPLE
+            4260
+        elif s == INA219_ADC_16SAMPLE
+            8510
+        elif s == INA219_ADC_32SAMPLE
+            17020
+        elif s == INA219_ADC_64SAMPLE
+            34050
+        else
+            68100
+    else
+        let res = s & 0x03
+        if res == INA219_ADC_9BIT
+            84
+        elif res == INA219_ADC_10BIT
+            148
+        elif res == INA219_ADC_11BIT
+            276
+        else
+            532
 
 // How long one conversion takes at this configuration.
 //
@@ -176,7 +239,17 @@ fn config_from_word(w: Int) -> I2cInaConfig []
 // other.
 pub @tier(embedded)
 fn conversion_time(c: I2cInaConfig) -> I2cConversion []
-    todo("i2c-devices-nv.ina219.conversion_time")
+    let shunt = adc_micros(c.shunt_adc)
+    let bus = adc_micros(c.bus_adc)
+    let mode = c.mode & 0x07
+    if mode == INA219_MODE_SHUNT_TRIGGERED or mode == INA219_MODE_SHUNT_CONTINUOUS
+        i2ctiming.conversion(shunt)
+    elif mode == INA219_MODE_BUS_TRIGGERED or mode == INA219_MODE_BUS_CONTINUOUS
+        i2ctiming.conversion(bus)
+    elif mode == INA219_MODE_BOTH_TRIGGERED or mode == INA219_MODE_BOTH_CONTINUOUS
+        i2ctiming.conversion(shunt + bus)
+    else
+        i2ctiming.immediate()
 
 // The largest shunt voltage this gain can measure, in microvolts.
 //
@@ -185,7 +258,7 @@ fn conversion_time(c: I2cInaConfig) -> I2cConversion []
 // and does not say why.
 pub @tier(embedded)
 fn gain_full_scale_uv(gain: Int) -> Int []
-    todo("i2c-devices-nv.ina219.gain_full_scale_uv")
+    40000 << (gain & 0x03)
 
 // ── The calibration (§ 8.5.1) ────────────────────────────────────────
 
@@ -222,6 +295,14 @@ struct I2cInaCalib
 // most the load will draw.  The current LSB comes out of the second,
 // and the register value out of both.
 //
+// The LSB is the promised current over 2^15, raised until the divisor
+// fits the sixteen-bit register, and rounded up to a multiple of 50 nA so
+// that the power LSB, twenty times it, is a whole number of microwatts.
+// The register value is the datasheet's formula with its bit 0, which the
+// part does not use, cleared.  A shunt or a current that is not positive
+// or is above a million ohms or a thousand amperes, and a divisor that
+// would come to less than two, answer `no_calibration`.
+//
 // THE MAXIMUM IS A PROMISE, NOT A LIMIT.  The part does not clamp at
 // it: a load that exceeds it sets the overflow flag and the current
 // register holds a number that is not the current.  Choosing it
@@ -236,7 +317,23 @@ struct I2cInaCalib
 // ```
 pub @tier(embedded)
 fn calibration(shunt_milliohm: Int, max_current_ua: Int) -> I2cInaCalib []
-    todo("i2c-devices-nv.ina219.calibration")
+    if shunt_milliohm <= 0 or shunt_milliohm > INA219_LIMIT or max_current_ua <= 0 or max_current_ua > INA219_LIMIT
+        no_calibration()
+    else
+        // The smallest LSB whose 15 bits reach the promised current, and
+        // the smallest that keeps the divisor inside the register.
+        let lsb_reach = (max_current_ua * 1000 + 32767) / 32768
+        let lsb_fit = (INA219_CAL_NUMERATOR * 1000 + 65534 * shunt_milliohm - 1) / (65534 * shunt_milliohm)
+        let lsb = if lsb_reach > lsb_fit
+            lsb_reach
+        else
+            lsb_fit
+        // A whole number of 50 nanoamperes, so that the power LSB, twenty
+        // times it, is a whole number of microwatts.
+        let lsb_na = (lsb + 49) / 50 * 50
+        let reg = (INA219_CAL_NUMERATOR * 1000 / (lsb_na * shunt_milliohm)) & 0xfffe
+        I2cInaCalib { reg: reg, current_lsb_na: lsb_na, power_lsb_uw: lsb_na / 50,
+                      shunt_milliohm: shunt_milliohm, ok: reg >= 2 }
 
 // A calibration that has not been computed: not ok.
 //
@@ -244,7 +341,7 @@ fn calibration(shunt_milliohm: Int, max_current_ua: Int) -> I2cInaCalib []
 // before it has written register 0x05.
 pub @tier(embedded)
 fn no_calibration() -> I2cInaCalib []
-    todo("i2c-devices-nv.ina219.no_calibration")
+    I2cInaCalib { reg: 0, current_lsb_na: 0, power_lsb_uw: 0, shunt_milliohm: 0, ok: false }
 
 // Whether the shunt voltage at this current fits the gain setting.
 //
@@ -264,13 +361,20 @@ fn no_calibration() -> I2cInaCalib []
 // ```
 pub @tier(embedded)
 fn gain_fits(gain: Int, shunt_milliohm: Int, max_current_ua: Int) -> Bool []
-    todo("i2c-devices-nv.ina219.gain_fits")
+    if shunt_milliohm <= 0 or shunt_milliohm > INA219_LIMIT or max_current_ua <= 0 or max_current_ua > INA219_LIMIT
+        false
+    else
+        max_current_ua * shunt_milliohm <= gain_full_scale_uv(gain) * 1000
 
 // The smallest gain setting that can see this current through this
 // shunt, or -1 when none can.
 pub @tier(embedded)
 fn gain_for(shunt_milliohm: Int, max_current_ua: Int) -> Int []
-    todo("i2c-devices-nv.ina219.gain_for")
+    var found = -1
+    for gain in 0..4
+        if found < 0 and gain_fits(gain, shunt_milliohm, max_current_ua)
+            found = gain
+    found
 
 // ── A reading ────────────────────────────────────────────────────────
 
@@ -304,7 +408,7 @@ struct I2cInaReading
 // reverse current into 655 mV of forward drop.
 pub @tier(embedded)
 fn shunt_uv_of(raw: Int) -> Int []
-    todo("i2c-devices-nv.ina219.shunt_uv_of")
+    sign16(raw) * INA219_SHUNT_LSB_TENTH_UV / 10
 
 // The bus voltage a register word means, in microvolts.
 //
@@ -317,11 +421,11 @@ fn shunt_uv_of(raw: Int) -> Int []
 // use ina219
 //
 // fn main() [io]
-//     println("${ina219.bus_uv_of(0x0678)}")   // 3308000, about 3.308 V
+//     println("${ina219.bus_uv_of(0x19d8)}")   // 3308000, about 3.308 V
 // ```
 pub @tier(embedded)
 fn bus_uv_of(raw: Int) -> Int []
-    todo("i2c-devices-nv.ina219.bus_uv_of")
+    ((raw >> 3) & 0x1fff) * INA219_BUS_LSB_UV
 
 // Whether the bus voltage word says a conversion has finished.
 //
@@ -331,12 +435,12 @@ fn bus_uv_of(raw: Int) -> Int []
 // register it never touches.
 pub @tier(embedded)
 fn bus_conversion_ready(raw: Int) -> Bool []
-    todo("i2c-devices-nv.ina219.bus_conversion_ready")
+    (raw & INA219_BUS_CNVR) != 0
 
 // Whether the bus voltage word says the part's math overflowed.
 pub @tier(embedded)
 fn bus_overflow(raw: Int) -> Bool []
-    todo("i2c-devices-nv.ina219.bus_overflow")
+    (raw & INA219_BUS_OVF) != 0
 
 // The current a register count means, in microamperes.
 //
@@ -345,44 +449,71 @@ fn bus_overflow(raw: Int) -> Bool []
 // marked uncalibrated so the zero cannot be read as a measurement.
 pub @tier(embedded)
 fn current_ua_of(raw: Int, cal: I2cInaCalib) -> Int []
-    todo("i2c-devices-nv.ina219.current_ua_of")
+    if cal.ok
+        sign16(raw) * cal.current_lsb_na / 1000
+    else
+        0
 
 // The power a register count means, in microwatts.
 pub @tier(embedded)
 fn power_uw_of(raw: Int, cal: I2cInaCalib) -> Int []
-    todo("i2c-devices-nv.ina219.power_uw_of")
+    if cal.ok
+        (raw & 0xffff) * cal.power_lsb_uw
+    else
+        0
 
 // A reading from the four register words and a calibration.
 pub @tier(embedded)
 fn reading_of(shunt_raw: Int, bus_raw: Int, current_raw: Int, power_raw: Int,
               cal: I2cInaCalib) -> I2cInaReading []
-    todo("i2c-devices-nv.ina219.reading_of")
+    I2cInaReading { shunt_uv: shunt_uv_of(shunt_raw),
+                    bus_uv: bus_uv_of(bus_raw),
+                    current_ua: current_ua_of(current_raw, cal),
+                    power_uw: power_uw_of(power_raw, cal),
+                    ready: bus_conversion_ready(bus_raw),
+                    overflow: bus_overflow(bus_raw),
+                    calibrated: cal.ok }
 
 // The bus voltage as a sample.
 pub @tier(embedded)
 fn voltage(r: I2cInaReading) -> I2cSample []
-    todo("i2c-devices-nv.ina219.voltage")
+    i2csample.range_checked(i2csample.sample(i2csample.I2C_Q_VOLTAGE, r.bus_uv))
 
 // The current as a sample, invalid without a calibration.
 pub @tier(embedded)
 fn current(r: I2cInaReading) -> I2cSample []
-    todo("i2c-devices-nv.ina219.current")
+    if r.calibrated and not r.overflow
+        i2csample.range_checked(i2csample.sample(i2csample.I2C_Q_CURRENT, r.current_ua))
+    else
+        i2csample.no_sample(i2csample.I2C_Q_CURRENT)
 
 // The power as a sample, invalid without a calibration.
 pub @tier(embedded)
 fn power(r: I2cInaReading) -> I2cSample []
-    todo("i2c-devices-nv.ina219.power")
+    if r.calibrated and not r.overflow
+        i2csample.range_checked(i2csample.sample(i2csample.I2C_Q_POWER, r.power_uw))
+    else
+        i2csample.no_sample(i2csample.I2C_Q_POWER)
 
 // The `i2cstatus` code this reading carries.
 //
 // `I2C_STATUS_SATURATED` when the part's math overflowed,
-// `I2C_STATUS_NOT_READY` when the conversion had not finished,
 // `I2C_STATUS_UNCALIBRATED` when the calibration register was never
-// written, and `I2C_STATUS_OK` otherwise.  The two voltages are
-// measurements in all four cases.
+// written, `I2C_STATUS_NOT_READY` when the conversion had not finished,
+// and `I2C_STATUS_OK` otherwise, checked in that order.  A missing
+// calibration is named before a conversion that is still running,
+// because waiting repairs the second and never the first.  The two
+// voltages are measurements in all four cases.
 pub @tier(embedded)
 fn reading_status(r: I2cInaReading) -> Int []
-    todo("i2c-devices-nv.ina219.reading_status")
+    if r.overflow
+        i2cstatus.I2C_STATUS_SATURATED
+    elif not r.calibrated
+        i2cstatus.I2C_STATUS_UNCALIBRATED
+    elif not r.ready
+        i2cstatus.I2C_STATUS_NOT_READY
+    else
+        i2cstatus.I2C_STATUS_OK
 
 // The power the two voltages imply, in microwatts, with no calibration.
 //
@@ -393,9 +524,38 @@ fn reading_status(r: I2cInaReading) -> Int []
 // has not been written, which is the state every INA219 powers up in.
 pub @tier(embedded)
 fn implied_power_uw(r: I2cInaReading, shunt_milliohm: Int) -> Int []
-    todo("i2c-devices-nv.ina219.implied_power_uw")
+    if shunt_milliohm <= 0
+        0
+    else
+        r.bus_uv * (r.shunt_uv * 1000 / shunt_milliohm) / 1000000
 
 // ── Over a bus ───────────────────────────────────────────────────────
+
+// The configuration register's reset bit: bit 15.
+const INA219_CONFIG_RESET = 0x8000
+
+// Whether a transfer completed and answered both bytes of a register.
+@tier(embedded)
+fn word_complete(w: I2cWord) -> Bool
+    w.ok and w.count == 2
+
+// A reading with no measurement in it: nothing converted, nothing
+// overflowed.  What a read refused for being early, and one whose
+// transfer failed, both answer.
+@tier(embedded)
+fn blank_reading(calibrated: Bool) -> I2cInaReading
+    I2cInaReading { shunt_uv: 0, bus_uv: 0, current_ua: 0, power_uw: 0, ready: false,
+                    overflow: false, calibrated: calibrated }
+
+// Write a sixteen-bit register: the register pointer and the two data
+// bytes, most significant first, as three bytes with no further
+// pointer.
+fn write16<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int, val: Int) -> Bool [e]
+    b.i2c_write_raw(addr, (reg << 16) | (val & 0xffff), 3)
+
+// Read a sixteen-bit register as two bytes in one transaction.
+fn read16<B: I2cDeviceBus[e]>(b: B, addr: Int, reg: Int) -> I2cWord [e]
+    b.i2c_read_reg(addr, reg, 2)
 
 // Reset the part to its power-on configuration.
 //
@@ -404,11 +564,11 @@ fn implied_power_uw(r: I2cInaReading, shunt_milliohm: Int) -> Int []
 // resets must calibrate again — and one that does not spends the rest
 // of its run reporting zero amperes.
 pub fn reset<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
-    todo("i2c-devices-nv.ina219.reset")
+    write16(b, addr, INA219_REG_CONFIG, INA219_CONFIG_RESET)
 
 // Write the configuration register.
 pub fn configure<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cInaConfig) -> Bool [e]
-    todo("i2c-devices-nv.ina219.configure")
+    write16(b, addr, INA219_REG_CONFIG, config_word(c))
 
 // Write the calibration register.
 //
@@ -416,26 +576,43 @@ pub fn configure<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cInaConfig) -> Bool [
 // Refuses a calibration that is not ok rather than writing a divisor
 // the caller did not compute.
 pub fn write_calibration<B: I2cDeviceBus[e]>(b: B, addr: Int, cal: I2cInaCalib) -> Bool [e]
-    todo("i2c-devices-nv.ina219.write_calibration")
+    cal.ok and write16(b, addr, INA219_REG_CALIBRATION, cal.reg)
 
 // Whether the calibration register holds something other than zero.
 //
 // The question a program should ask before it trusts a current reading,
 // and the one this part gives no other way to answer.
 pub fn is_calibrated<B: I2cDeviceBus[e]>(b: B, addr: Int) -> Bool [e]
-    todo("i2c-devices-nv.ina219.is_calibrated")
+    let w = read16(b, addr, INA219_REG_CALIBRATION)
+    word_complete(w) and i2cbus.be_u16_at(w, 0) != 0
 
 // Trigger a conversion in a triggered mode and answer how long it
 // takes.
+//
+// A configuration write that is not acknowledged answers
+// `i2ctiming.not_started`.
 //
 // In a triggered mode the conversion starts when the configuration
 // register is written, so this rewrites it.  In a continuous mode the
 // part is already converting and this answers the conversion time
 // without writing anything.
 pub fn start_measurement<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cInaConfig) -> I2cConversion [e]
-    todo("i2c-devices-nv.ina219.start_measurement")
+    let mode = c.mode & 0x07
+    let triggered = mode == INA219_MODE_SHUNT_TRIGGERED or mode == INA219_MODE_BUS_TRIGGERED or mode == INA219_MODE_BOTH_TRIGGERED
+    if triggered and not configure(b, addr, c)
+        i2ctiming.not_started()
+    else
+        conversion_time(c)
 
-// Read all four measurement registers.
+// Read all four measurement registers, refusing a read that is too
+// early.
+//
+// A read before the conversion time has elapsed, and a read in which a
+// transfer failed, which stops the reads there, answer a reading with
+// nothing in it: `ready` is
+// false, and `reading_status` names it `I2C_STATUS_NOT_READY` or
+// `I2C_STATUS_UNCALIBRATED`.  `i2ctiming.ready_status` tells the first
+// from a dead bus.
 //
 // FOUR TRANSACTIONS, and the order is the part's: the power register is
 // read last because reading it is what clears the conversion-ready
@@ -443,7 +620,24 @@ pub fn start_measurement<B: I2cDeviceBus[e]>(b: B, addr: Int, c: I2cInaConfig) -
 // polling loop miss the conversion it was waiting for.
 pub fn read_reading<B: I2cDeviceBus[e]>(b: B, addr: Int, cal: I2cInaCalib, c: I2cConversion,
                                         waited_micros: Int) -> I2cInaReading [e]
-    todo("i2c-devices-nv.ina219.read_reading")
+    if not i2ctiming.is_elapsed(c, waited_micros)
+        return blank_reading(cal.ok)
+    let shunt = read16(b, addr, INA219_REG_SHUNT)
+    if not word_complete(shunt)
+        return blank_reading(cal.ok)
+    let bus = read16(b, addr, INA219_REG_BUS)
+    if not word_complete(bus)
+        return blank_reading(cal.ok)
+    let current = read16(b, addr, INA219_REG_CURRENT)
+    if not word_complete(current)
+        return blank_reading(cal.ok)
+    // Last, because reading it clears the conversion-ready flag.
+    let power = read16(b, addr, INA219_REG_POWER)
+    if word_complete(power)
+        reading_of(i2cbus.be_u16_at(shunt, 0), i2cbus.be_u16_at(bus, 0),
+                   i2cbus.be_u16_at(current, 0), i2cbus.be_u16_at(power, 0), cal)
+    else
+        blank_reading(cal.ok)
 
 // Read the two voltages and nothing else.
 //
@@ -452,4 +646,11 @@ pub fn read_reading<B: I2cDeviceBus[e]>(b: B, addr: Int, cal: I2cInaCalib, c: I2
 // own arithmetic, and for a diagnostic against a part whose calibration
 // is in doubt.
 pub fn read_voltages<B: I2cDeviceBus[e]>(b: B, addr: Int) -> I2cInaReading [e]
-    todo("i2c-devices-nv.ina219.read_voltages")
+    let shunt = read16(b, addr, INA219_REG_SHUNT)
+    if not word_complete(shunt)
+        return blank_reading(false)
+    let bus = read16(b, addr, INA219_REG_BUS)
+    if word_complete(bus)
+        reading_of(i2cbus.be_u16_at(shunt, 0), i2cbus.be_u16_at(bus, 0), 0, 0, no_calibration())
+    else
+        blank_reading(false)

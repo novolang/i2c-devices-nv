@@ -1,0 +1,151 @@
+// i2cboard.nv — the I2C bus of a board as the bus the drivers here are
+// written over.
+//
+// `BoardBus` implements `I2cDeviceBus[hw]` for embedded-hal-nv's
+// `BoardI2c`, the handle that names one of the board's I2C buses, so
+// `bme280.read_calibration(bus, 0x76)` on a microcontroller is the same
+// call as on a table of recorded bytes.  Each method is one transaction
+// on the board's hook: a register read is `write_read`, which writes the
+// register pointer and reads with a repeated start in one transaction,
+// as `i2cbus` requires.
+//
+// THE BYTES CHANGE SHAPE ON THE WAY.  embedded-hal-nv moves a transfer as
+// a list of `u8` and answers `None` when nothing acknowledged, where a
+// driver here moves up to eight bytes in one integer and answers a word
+// that carries its own refusal.  `word_of` and `bytes_of` are the two
+// conversions, public because any bus written over a byte-list interface
+// needs them.
+//
+// ZERO BYTES PROBE AN ADDRESS.  `i2c_present` writes an empty list, which
+// is the only probe that cannot trigger a measurement or clear a flag in
+// a part whose registers are unknown.  Whether a board's hook performs a
+// zero-length write is the board's: one that refuses it answers false for
+// every address, and a scan then finds nothing.
+//
+// THE FREQUENCY IS THE CALLER'S TO STATE.  `BoardI2c` can set a bus's
+// frequency and cannot report it, so `open` keeps the number it
+// initialised the bus with and `i2c_frequency` answers it.
+
+use embedded_hal.{ BoardI2c, I2cBus }
+use i2cbus
+
+// A board's I2C bus, and the frequency it was initialised at.
+pub @value
+struct BoardBus
+    bus: BoardI2c
+    freq: Int
+
+// Initialise the board's I2C bus number `id` at `freq` hertz and answer
+// it as a bus.
+//
+// `id` is as `BoardI2c` takes it: 0 is the bus the board's documentation
+// names for `hal.i2c`.  Standard mode is 100000 and fast mode is 400000.
+// Call it once, before the first transaction.
+//
+// ```novo
+// use std.str
+// use i2cboard
+//
+// @tier(rt)
+// fn main() [hw]
+//     let b = i2cboard.open(0, 400000)
+//     hal.uart.write(str.from_int(b.i2c_frequency()))   // 400000
+// ```
+pub @tier(rt)
+fn open(id: Int, freq: Int) -> BoardBus [hw]
+    let handle = BoardI2c { id: id }
+    handle.init(freq)
+    BoardBus { bus: handle, freq: freq }
+
+// The bytes a transfer answered, as a word.
+//
+// `None` is a transfer nothing acknowledged, and answers the failed
+// word.  So does a list whose length is not `n`, because a word that
+// claims `n` bytes and holds fewer is a reply that was cut short.  `n` is
+// 1 to 8.
+//
+// ```novo
+// use i2cbus
+// use i2cboard
+//
+// fn main() [io]
+//     let w = i2cboard.word_of(Some([0x12 as u8, 0x34 as u8]), 2)
+//     println("${i2cbus.be_u16_at(w, 0)}")   // 4660, which is 0x1234
+// ```
+pub @tier(rt)
+fn word_of(reply: ?[u8], n: Int) -> I2cWord []
+    match reply
+        Some(buf) => word_of_list(buf, n)
+        None      => i2cbus.word_failed()
+
+// The list a reply came in, as a word, or the failed word.
+@tier(rt)
+fn word_of_list(buf: [u8], n: Int) -> I2cWord
+    if n < 1 or n > 8 or list.len(buf) != n
+        i2cbus.word_failed()
+    else
+        var acc = 0
+        for k in 0..n
+            acc = (acc << 8) | buf[k] as Int
+        i2cbus.word(acc, n)
+
+// The low `len` bytes of `bytes`, most significant first, as a list.
+//
+// What `i2c_write_raw` sends: a Sensirion command is two bytes and an
+// INA219 register write is three.  `len` is held to 0 through 8.
+//
+// ```novo
+// use i2cboard
+//
+// fn main() [io]
+//     let sent = i2cboard.bytes_of(0x2400, 2)
+//     println("${sent[0]} ${sent[1]}")   // 36 0
+// ```
+pub @tier(rt)
+fn bytes_of(bytes: Int, len: Int) -> [u8] []
+    let n = if len < 0
+        0
+    else if len > 8
+        8
+    else
+        len
+    var out: [u8] = []
+    for k in 0..n
+        list.push(out, ((bytes >>> (8 * (n - 1 - k))) & 0xff) as u8)
+    out
+
+impl I2cDeviceBus[hw] for BoardBus
+    // One register write: the pointer and the byte, acknowledged or not.
+    @tier(rt)
+    fn i2c_write_reg(self, addr: Int, reg: Int, val: Int) -> Bool [hw]
+        let bus = self.bus
+        bus.write_reg(addr, reg, val)
+
+    // The pointer written and `n` bytes read back, in one transaction.
+    @tier(rt)
+    fn i2c_read_reg(self, addr: Int, reg: Int, n: Int) -> I2cWord [hw]
+        let bus = self.bus
+        word_of(bus.write_read(addr, [reg as u8], n), n)
+
+    // Up to eight bytes written with no register pointer.
+    @tier(rt)
+    fn i2c_write_raw(self, addr: Int, bytes: Int, len: Int) -> Bool [hw]
+        let bus = self.bus
+        bus.write(addr, bytes_of(bytes, len))
+
+    // `n` bytes read with no register pointer.
+    @tier(rt)
+    fn i2c_read_raw(self, addr: Int, n: Int) -> I2cWord [hw]
+        let bus = self.bus
+        word_of(bus.read(addr, n), n)
+
+    // An empty write, acknowledged or not.
+    @tier(rt)
+    fn i2c_present(self, addr: Int) -> Bool [hw]
+        let bus = self.bus
+        bus.write(addr, bytes_of(0, 0))
+
+    // The frequency the caller said the bus runs at.
+    @tier(rt)
+    fn i2c_frequency(self) -> Int
+        self.freq

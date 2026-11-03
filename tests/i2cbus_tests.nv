@@ -1,20 +1,18 @@
 // i2cbus_tests.nv — the half of the package that drives a bus, named
 // from outside it with a bus of the caller's own.
 //
-// RED ON PURPOSE: the first `todo()` each test reaches ends it.
-//
 // THE POINT OF THIS FILE IS THE IMPL.  `I2cTestTape` satisfies
 // `I2cDeviceBus[]` — the empty supply, which is how an implementation
 // asserts it is pure (SPEC § 5.6) — so every driver function in this
 // package is called here at NO EFFECT AT ALL.  That is the claim the
-// layer rests on: a `core` package whose bus functions declare `[e]`
+// functions rest on: a package whose bus functions declare `[e]`
 // costs a caller whatever the caller's bus costs, and a caller whose
 // bus is a table of recorded bytes pays nothing.  The same functions
 // against a peripheral driver would be `[hw]`, and nothing in this
 // package changes.
 //
-// It is also the shape a real test suite will take once the bodies
-// land: a recorded exchange with a part, replayed with no hardware.
+// It is also the shape of a suite over recorded exchanges: a recorded
+// exchange with a part, replayed with no hardware.
 
 use std.test
 use bh1750
@@ -30,7 +28,9 @@ use sht3x
 // Enough to name every signature; a suite with bodies behind it would
 // carry a script of expected transactions instead.
 struct I2cTestTape
-    // The bytes every read answers.
+    // The bytes every read answers, the first byte off the bus in the
+    // highest byte of the integer: a read of `n` bytes gets the first
+    // `n` of them.
     canned: Int
     // Whether the part at every address acknowledges.
     responds: Bool
@@ -41,7 +41,7 @@ impl I2cDeviceBus[] for I2cTestTape
 
     fn i2c_read_reg(self, addr: Int, reg: Int, n: Int) -> I2cWord
         if self.responds
-            i2cbus.word(self.canned, n)
+            i2cbus.word(self.canned >>> (64 - 8 * n), n)
         else
             i2cbus.word_failed()
 
@@ -50,7 +50,7 @@ impl I2cDeviceBus[] for I2cTestTape
 
     fn i2c_read_raw(self, addr: Int, n: Int) -> I2cWord
         if self.responds
-            i2cbus.word(self.canned, n)
+            i2cbus.word(self.canned >>> (64 - 8 * n), n)
         else
             i2cbus.word_failed()
 
@@ -62,6 +62,11 @@ impl I2cDeviceBus[] for I2cTestTape
 
 fn a_tape() -> I2cTestTape
     I2cTestTape { canned: 0x6085000000000000, responds: true }
+
+// A bus whose three-byte answer is a status word with its checksum: the
+// word 0x0010, the SHT3x's "restarted" bit, and its CRC-8, 0xc2.
+fn a_status_tape() -> I2cTestTape
+    I2cTestTape { canned: 0x0010c20000000000, responds: true }
 
 fn a_dead_bus() -> I2cTestTape
     I2cTestTape { canned: 0, responds: false }
@@ -153,7 +158,7 @@ fn test_the_sensirion_part_is_broken_out_of_periodic_mode_first() [io]
     test.assert(sht3x.command(b, sht3x.SHT3X_ADDR_LOW, sht3x.SHT3X_CMD_BREAK))
 
     test.case("the status register, and clearing it")
-    test.assert(sht3x.read_status(b, sht3x.SHT3X_ADDR_LOW) >= 0)
+    test.assert(sht3x.read_status(a_status_tape(), sht3x.SHT3X_ADDR_LOW) >= 0)
     test.assert(sht3x.clear_status(b, sht3x.SHT3X_ADDR_LOW))
 
     test.case("the heater is a diagnostic, not a thermostat")

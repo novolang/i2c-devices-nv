@@ -1,9 +1,6 @@
 // bme280_tests.nv — the compensation arithmetic, the two byte orders,
 // and the register ordering the part insists on.
 //
-// RED ON PURPOSE, like every suite here: the first `todo()` each test
-// reaches ends it.
-//
 // THE DATASHEET'S OWN WORKED EXAMPLE IS THE ORACLE.  BST-BME280-DS002
 // § 4.2.3 prints a raw temperature of 519888 and a raw pressure of
 // 415148 against a named set of coefficients, and says the answers are
@@ -18,9 +15,11 @@ use i2csample
 use i2cstatus
 use i2ctiming
 
-// The datasheet's example temperature coefficients (§ 4.2.3).
+// The datasheet's example temperature coefficients (§ 4.2.3): dig_T1
+// 27504, dig_T2 26435 and dig_T3 -1000, as the six calibration bytes
+// 70 6b 43 67 18 fc, least significant byte first.
 fn example_temp_cal() -> I2cBmeTempCal
-    bme280.temp_cal_from(i2cbus.word(0, 8))
+    bme280.temp_cal_from(i2cbus.word(0x706b436718fc, 6))
 
 @test
 fn test_the_three_recommended_settings_are_the_datasheets() [io]
@@ -128,7 +127,7 @@ fn test_the_eight_byte_block_is_read_as_one_burst() [io]
     // single-register reads, so three bytes come from one conversion
     // and three from the next.
     test.case("all three raw values come out of one word")
-    let w = i2cbus.word(0x6684000082f80080, 8)
+    let w = i2cbus.word(0x66840082f8000080, 8)
     let raw = bme280.raw_from(w)
     test.assert(raw.ok)
     test.assert_eq(raw.press, 0x66840)

@@ -14,9 +14,14 @@ QEMU for a Cortex-M and prints `PASS` with all 104 of its checks. The
 manifest moves to `stability = "experimental"`, `version = "0.1.0"`,
 `layer = "host"` and `novo = ">= 0.22.0"`.
 
+The dependency asks for embedded-hal-nv ^0.4.0, the minor the other drivers and the
+board packages ask for, so one version of it serves a program that takes the package
+beside any of them.  No signature of the package changed; the probe builds for
+`nrf52-qemu` at 15,068 B of flash (14,988 B on ^0.2.1) and prints `PASS`.
+
 ### Changed
 
-- **The layer is `host`, and `embedded-hal-nv ^0.2.1` is a dependency.**
+- **The layer is `host`, and `embedded-hal-nv ^0.4.0` is a dependency.**
   `i2cboard` implements `I2cDeviceBus[hw]` for the board's I2C bus, and
   that bus is embedded-hal-nv's. A `core` package depends only on `core`
   packages, so the layer follows the module. Every other module is

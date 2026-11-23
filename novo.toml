@@ -40,7 +40,7 @@ novo        = ">= 0.22.0"
 [dependencies]
 # `BoardI2c`, the handle `i2cboard` wraps, and the `I2cBus` trait it is
 # driven through.
-embedded-hal-nv = "^0.2.1"
+embedded-hal-nv = "^0.4.0"
 #
 # Two packages are left out on purpose.
 #
